@@ -148,7 +148,7 @@ class WholeBodyIK:
         # sub_dt: Integration step per iteration [seconds]
         # Smaller → more conservative steps, better stability
         # Total displacement ≈ velocity * dt (split across n_iter sub-steps)
-        sub_dt = dt / max(n_iter, 1)
+        sub_dt = 0.001  # fixed 1ms integration step (was: dt / n_iter which was too large)
 
         # Get IK parameters from config
         kp_fp = self.ik_cfg.KP_FOOT_POSITION
