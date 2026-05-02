@@ -214,7 +214,7 @@ class PhaseManagerConfig:
     """Walking phase manager parameters for G1 robot locomotion."""
     # Phase timing (seconds)
     SETTLE_TIME: float = 7.0  # Time to settle robot on ground after initialization
-    BALANCE_TIME: float = 10.0  # Time to maintain static balance before starting walk
+    BALANCE_TIME: float = 15.0  # Time to maintain static balance before starting walk
     PREPARE_TIME: float = 0.3  # Time to prepare for next step (transition to single support)
     STEP_TIME: float = 0.6  # Duration of single support phase (stepping)
     DOUBLE_SUPPORT_TIME: float = 0.2  # Time in double support phase (both feet on ground)
@@ -230,12 +230,12 @@ class PhaseManagerConfig:
     STEP_OFFSET: float = 0.1  # [m] offset for foot placement from center line
 
     # Balance ramp parameters
-    BALANCE_RAMP_RATIO: float = 0.7  # Fraction of balance time for ramping (rest is holding)
+    BALANCE_RAMP_RATIO: float = 0.5  # Fraction of balance time for ramping (rest is holding)
 
     # Real-time pacing multipliers
-    SETTLE_PACE: float = 0.5  # Multiplier for settle phase (< 1 = faster than real-time)
-    BALANCE_PACE: float = 0.3  # Multiplier for balance phase
-    HOLD_PACE: float = 0.3  # Multiplier for stability hold phase
+    SETTLE_PACE: float = 1.0  # Multiplier for settle phase (< 1 = faster than real-time)
+    BALANCE_PACE: float = 1.0  # Multiplier for balance phase
+    HOLD_PACE: float = 1.0  # Multiplier for stability hold phase
 
     # Status reporting interval
     STATUS_INTERVAL: float = 0.5  # [s] How often to print status during phases
@@ -250,26 +250,26 @@ class WholeBodyIKConfig:
     # 200 means: 1cm error → 2 m/s desired correction velocity
     KP_FOOT_ROTATION: float = 100.0  # [1/s] Foot orientation tracking gain
     # High but less than position — orientation drift is less critical
-    KP_COM: float = 60.0  # [1/s] CoM tracking gain
+    KP_COM: float = 20.0  # [1/s] CoM tracking gain
     # Lower than feet — CoM can move more slowly
 
     # Task weights for weighted least-squares optimization
     WEIGHT_FOOT_POSITION: float = 2000.0  # Weight for foot position tracking error
-    WEIGHT_FOOT_ROTATION: float = 800.0  # Weight for foot orientation tracking error
-    WEIGHT_COM: float = 200.0  # Weight for CoM tracking
+    WEIGHT_FOOT_ROTATION: float = 500.0  # Weight for foot orientation tracking error
+    WEIGHT_COM: float = 100.0  # Weight for CoM tracking
 
     # Regularization parameters
-    JOINT_REG_WEIGHT: float = 5.0  # Weight for joint regularization (keeping joints near nominal)
-    DAMPING: float = 5e-3  # Tikhonov damping for pseudo-inverse stability
+    JOINT_REG_WEIGHT: float = 2.0  # Weight for joint regularization (keeping joints near nominal)
+    DAMPING: float = 1e-4  # Tikhonov damping for pseudo-inverse stability
 
     # Velocity limits
-    MAX_JOINT_VELOCITY: float = 4.0  # [rad/s] Maximum joint velocity in IK solution
+    MAX_JOINT_VELOCITY: float = 2.0  # [rad/s] Maximum joint velocity in IK solution
     # 4 rad/s ≈ 230 deg/s — fast but physically plausible for a humanoid
 
     # Optimization parameters
     MAX_ITERATIONS: int = 100  # Maximum iterations for IK optimization
-    DEFAULT_ITERATIONS: int = 5  # Default iterations per solve call
-    TRACKING_ITERATIONS: int = 3  # Iterations when in tracking mode (synced every tick)
+    DEFAULT_ITERATIONS: int = 10  # Default iterations per solve call
+    TRACKING_ITERATIONS: int = 5  # Iterations when in tracking mode (synced every tick)
     TOLERANCE: float = 1e-6  # Convergence tolerance for optimization
 
     # Joint limits safety margin
