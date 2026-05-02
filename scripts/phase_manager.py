@@ -7,7 +7,21 @@ from zmp_controller import ZMPPreviewController
 from whole_body_ik import WholeBodyIK
 from joint_controller import JointController
 from dataclasses import dataclass
-from config import cfg  # ── Verbose debug flag ───────────────────────────────────────── # Set DBG=True to enable per-tick diagnostic output. # Toggle off once the issue is found to keep logs clean. DBG = True DBG_TICK_INTERVAL = 10   # print every N control ticks when DBG=True  def _dbg(*args, **kwargs):     """Print only when DBG is enabled."""     if DBG:         print("  [DBG]", *args, **kwargs)
+from config import cfg
+
+# ================================================================
+# VERBOSE DEBUG LOGGING
+# Set DBG = True to enable per-tick diagnostic output.
+# Set DBG = False once the issue is found to keep logs clean.
+# ================================================================
+DBG = True
+DBG_TICK_INTERVAL = 10  # print every N control ticks when DBG=True
+
+
+def _dbg(*args, **kwargs):
+    """Print only when DBG is enabled."""
+    if DBG:
+        print("  [DBG]", *args, **kwargs)
 
 
 # ================================================================
