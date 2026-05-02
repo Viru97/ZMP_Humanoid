@@ -157,16 +157,68 @@ class VisualizedPhaseManager:
         print(f"  [Sim] sim_dt={self.sim_dt:.4f}s, ctrl_dt={self.ctrl_dt:.3f}s, "
               f"sub-steps={self.steps_per_ctrl}")
 
+        # --- Resolve mocap body indices for visualization markers ---
+        # Maps short key → mocap array index (or -1 if not found)
+        marker_names = {
+            "actual_com": "marker_actual_com",
+            "target_com": "marker_target_com",
+            "ref_zmp":    "marker_ref_zmp",
+            "lf":         "marker_lf",
+            "rf":         "marker_rf",
+        }
+        self._mocap_idx: dict = {}
+        for key, name in marker_names.items():
+            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if body_id < 0:
+                self._mocap_idx[key] = -1
+            else:
+                mocap_id = model.body_mocapid[body_id]
+                self._mocap_idx[key] = mocap_id
+
+    def _update_markers(self, actual_com: np.ndarray, target_com: np.ndarray,
+                        ref_zmp_xy: np.ndarray, lf_pos: np.ndarray,
+                        rf_pos: np.ndarray):
+        """
+        Write current positions to the 5 mocap visualization markers.
+
+        Parameters:
+            actual_com:  shape (3,) — current whole-body CoM
+            target_com:  shape (3,) — IK CoM target
+            ref_zmp_xy:  shape (2,) — reference ZMP in XY plane
+            lf_pos:      shape (3,) — left foot world position
+            rf_pos:      shape (3,) — right foot world position
+        """
+        n_mocap = self.data.mocap_pos.shape[0]
+
+        _MARKER_Z = 0.005  # Raise floor-level markers just above ground [m]
+
+        def _set(key: str, pos: np.ndarray):
+            idx = self._mocap_idx.get(key, -1)
+            if 0 <= idx < n_mocap:
+                self.data.mocap_pos[idx] = pos
+
+        _set("actual_com", actual_com)
+        _set("target_com", target_com)
+        _set("ref_zmp", np.array([ref_zmp_xy[0], ref_zmp_xy[1], _MARKER_Z]))
+        _set("lf",      np.array([lf_pos[0],     lf_pos[1],     _MARKER_Z]))
+        _set("rf",      np.array([rf_pos[0],     rf_pos[1],     _MARKER_Z]))
+
     def step_sim(self, q_target: np.ndarray, n_sub: Optional[int] = None,
-                 sync_viewer: bool = True, realtime: bool = True):
+                 sync_viewer: bool = True, realtime: bool = True,
+                 com_target: Optional[np.ndarray] = None,
+                 ref_zmp_xy: Optional[np.ndarray] = None):
         """
         Execute one control tick: apply control + sub-step physics + sync viewer.
 
         Parameters:
-            q_target: np.ndarray [nq] - desired joint configuration
-            n_sub: int or None - number of physics sub-steps (default: steps_per_ctrl)
+            q_target:    np.ndarray [nq] - desired joint configuration
+            n_sub:       int or None - number of physics sub-steps (default: steps_per_ctrl)
             sync_viewer: bool - whether to update the viewer after stepping
-            realtime: bool - (currently unused, pacing is done externally)
+            realtime:    bool - (currently unused, pacing is done externally)
+            com_target:  Optional[np.ndarray] shape (3,) — IK CoM target for marker;
+                         defaults to actual CoM if None
+            ref_zmp_xy:  Optional[np.ndarray] shape (2,) — reference ZMP for marker;
+                         defaults to actual CoM XY if None
         """
         n = n_sub if n_sub else self.steps_per_ctrl
         for _ in range(n):
@@ -174,6 +226,14 @@ class VisualizedPhaseManager:
             self.controller.set_targets_from_qpos(self.data, q_target)
             # Advance physics by one sim_dt step
             mujoco.mj_step(self.model, self.data)
+
+        # Update visualization markers before syncing the viewer
+        actual_com = self.robot.get_com(self.data)
+        _target_com = com_target if com_target is not None else actual_com
+        _ref_zmp_xy = ref_zmp_xy if ref_zmp_xy is not None else actual_com[:2]
+        lf_pos = self.data.xpos[self.robot.left_foot_id]
+        rf_pos = self.data.xpos[self.robot.right_foot_id]
+        self._update_markers(actual_com, _target_com, _ref_zmp_xy, lf_pos, rf_pos)
 
         # Update viewer display
         if sync_viewer and self.viewer.is_running():
@@ -326,7 +386,7 @@ class VisualizedPhaseManager:
             # Fewer iterations because we sync every tick anyway.
             # The small residual error is corrected next tick.
             q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=ik_tracking_iter)
-            self.step_sim(q_target)
+            self.step_sim(q_target, com_target=com_target)
 
             # Report at configured interval
             if tick % status_interval == 0:
@@ -396,7 +456,7 @@ class VisualizedPhaseManager:
             # Track mode: sync every tick, solve, apply
             self.ik.sync_from_sim(self.data.qpos)
             q_target = self.ik.solve(hold_target, dt=self.ctrl_dt, n_iter=ik_tracking_iter)
-            self.step_sim(q_target)
+            self.step_sim(q_target, com_target=hold_target)
 
             if tick % status_interval == 0:
                 status = self.monitor.snapshot(self.data, "HOLD", tick, hold_target)
@@ -550,7 +610,9 @@ class VisualizedPhaseManager:
             q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=ik_default_iter)
 
             # Step simulation with the IK-solved target
-            self.step_sim(q_target, sync_viewer=True, realtime=False)
+            self.step_sim(q_target, sync_viewer=True, realtime=False,
+                          com_target=com_target,
+                          ref_zmp_xy=np.array([ref_x[tick], ref_y[tick]]))
 
             # --- Monitoring ---
             # Every 200 ticks (2.0s): detailed status print
