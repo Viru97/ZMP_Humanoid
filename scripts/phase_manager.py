@@ -1,11 +1,13 @@
 import mujoco
 import numpy as np
 import time
+from typing import Optional
 from robot_model import G1RobotModel
 from zmp_controller import ZMPPreviewController
 from whole_body_ik import WholeBodyIK
 from joint_controller import JointController
 from dataclasses import dataclass
+from config import cfg
 
 
 # ================================================================
@@ -32,6 +34,8 @@ class StatusMonitor:
     def __init__(self, robot: G1RobotModel):
         self.robot = robot
         self.history = []  # List of RobotStatus snapshots
+        # Get fall threshold from config
+        self.fall_threshold = cfg.ROBOT.FALL_HEIGHT_THRESHOLD
 
     def snapshot(self, data: mujoco.MjData, phase: str, tick: int,
                  target: Optional[np.ndarray] = None) -> RobotStatus:
@@ -72,15 +76,18 @@ class StatusMonitor:
               f"FC=[{status.foot_center[0]:.3f},{status.foot_center[1]:.3f}] | "
               f"xy_err={status.xy_error:.4f} {status.extra}")
 
-    def is_fallen(self, data: mujoco.MjData, threshold: float = 0.30) -> bool:
+    def is_fallen(self, data: mujoco.MjData, threshold: float = None) -> bool:
         """
         Check if robot has fallen.
 
         Parameters:
             threshold: float [meters] - CoM height below which robot is "fallen"
+                      Default from config.ROBOT.FALL_HEIGHT_THRESHOLD
                       0.30m is well below any humanoid's standing height.
                       G1 standing height is ~0.7m; anything below 0.30 is on the ground.
         """
+        if threshold is None:
+            threshold = self.fall_threshold
         com = self.robot.get_com(data)
         return com[2] < threshold
 
@@ -120,7 +127,7 @@ class VisualizedPhaseManager:
         self.ik = WholeBodyIK(self.robot)
         self.monitor = StatusMonitor(self.robot)
 
-        # --- Timing parameters ---
+        # --- Timing parameters from config ---
         # sim_dt: Physics simulation timestep [seconds]
         #   Set in model XML. Smaller → more accurate physics but slower.
         #   0.001s (1kHz) is standard for contact-rich humanoid simulation.
@@ -130,13 +137,22 @@ class VisualizedPhaseManager:
         #   How often we run IK + update control targets.
         #   0.01s (100Hz) is typical for whole-body control.
         #   Must be ≥ sim_dt. The gap is filled by sub-stepping.
-        self.ctrl_dt = 0.01
+        self.ctrl_dt = cfg.SIMULATION.CONTROL_DT
 
         # steps_per_ctrl: Number of physics steps per control update
         #   = ctrl_dt / sim_dt = 0.01 / 0.001 = 10
         #   Between each IK solve, the simulation runs 10 physics steps
         #   with the SAME control target held constant.
         self.steps_per_ctrl = max(1, int(self.ctrl_dt / self.sim_dt))
+
+        # Get phase configuration
+        self.phase_cfg = cfg.PHASE
+
+        # Get robot configuration for thresholds
+        self.robot_cfg = cfg.ROBOT
+
+        # Get controller configuration
+        self.ctrl_cfg = cfg.CONTROLLER
 
         print(f"  [Sim] sim_dt={self.sim_dt:.4f}s, ctrl_dt={self.ctrl_dt:.3f}s, "
               f"sub-steps={self.steps_per_ctrl}")
@@ -166,7 +182,7 @@ class VisualizedPhaseManager:
     # ============================
     # PHASE 1: Settle
     # ============================
-    def phase_settle(self, duration: float = 3.0) -> bool:
+    def phase_settle(self, duration: float = None) -> bool:
         """
         Let robot settle into natural standing under default pose control.
 
@@ -176,12 +192,15 @@ class VisualizedPhaseManager:
 
         Parameters:
             duration: float [seconds] - how long to settle
-                     3.0s is enough for transients to die out.
-                     If robot is still bouncing after 3s, there's a model issue.
+                     Default from config. Enough for transients to die out.
+                     If robot is still bouncing after this, there's a model issue.
 
         Returns:
-            bool: True if robot is still standing (CoM > 0.35m), False if fallen.
+            bool: True if robot is still standing (CoM > threshold), False if fallen.
         """
+        if duration is None:
+            duration = self.phase_cfg.SETTLE_TIME
+
         print("\n" + "="*60)
         print("  PHASE 1: SETTLING (default pose hold)")
         print("="*60)
@@ -191,11 +210,14 @@ class VisualizedPhaseManager:
         # Target: model's default joint angles
         q_default = self.model.qpos0.copy()
 
+        # Status reporting interval in ticks
+        status_interval = int(self.phase_cfg.STATUS_INTERVAL / self.ctrl_dt)
+
         for tick in range(n_ticks):
             self.step_sim(q_default)
 
-            # Report every 0.5 seconds
-            if tick % int(0.5 / self.ctrl_dt) == 0:
+            # Report at configured interval
+            if tick % status_interval == 0:
                 status = self.monitor.snapshot(self.data, "SETTLE", tick)
                 self.monitor.print_status(status)
 
@@ -207,19 +229,18 @@ class VisualizedPhaseManager:
             if not self.viewer.is_running():
                 return False
 
-            # Sleep for visual pacing (0.5x real-time to watch settling)
-            # 0.5 multiplier: runs 2x faster than real-time for quicker startup
-            time.sleep(self.ctrl_dt * 0.5)
+            # Sleep for visual pacing (configurable multiplier for real-time)
+            time.sleep(self.ctrl_dt * self.phase_cfg.SETTLE_PACE)
 
         com = self.robot.get_com(self.data)
         print(f"  SETTLE COMPLETE: CoM height = {com[2]:.4f}m")
-        # 0.35m threshold: G1 stands ~0.7m; below 0.35 means collapsed
-        return com[2] > 0.35
+        # Use configured minimum standing height threshold
+        return com[2] > self.robot_cfg.MIN_STANDING_HEIGHT
 
     # ============================
     # PHASE 2: Balance acquisition
     # ============================
-    def phase_balance(self, duration: float = 6.0) -> bool:
+    def phase_balance(self, duration: float = None) -> bool:
         """
         Gradually shift CoM horizontally over support polygon center.
 
@@ -233,11 +254,14 @@ class VisualizedPhaseManager:
 
         Parameters:
             duration: float [seconds] - total time for balance acquisition
-                     6.0s gives a gentle, stable ramp. Shorter may cause jerk.
+                     Default from config. Gives a gentle, stable ramp.
 
         Returns:
-            bool: True if balanced (height > 0.35m), False if fallen.
+            bool: True if balanced (height > threshold), False if fallen.
         """
+        if duration is None:
+            duration = self.phase_cfg.BALANCE_TIME
+
         print("\n" + "="*60)
         print("  PHASE 2: BALANCE ACQUISITION (CoM -> foot center)")
         print("="*60)
@@ -249,9 +273,9 @@ class VisualizedPhaseManager:
         self.ik.capture_foot_targets()
 
         n_ticks = int(duration / self.ctrl_dt)
-        # ramp_ticks: 70% of duration for the ramp, 30% for holding at target
+        # ramp_ticks: configurable fraction of duration for the ramp, rest for holding at target
         # This ensures smooth approach + time to verify stability at the end.
-        ramp_ticks = int(n_ticks * 0.7)
+        ramp_ticks = int(n_ticks * self.phase_cfg.BALANCE_RAMP_RATIO)
 
         initial_com = self.robot.get_com(self.data)
         mujoco.mj_kinematics(self.model, self.data)
@@ -259,6 +283,12 @@ class VisualizedPhaseManager:
 
         print(f"  Starting CoM: [{initial_com[0]:.4f}, {initial_com[1]:.4f}, {initial_com[2]:.4f}]")
         print(f"  Foot center:  [{foot_center[0]:.4f}, {foot_center[1]:.4f}, {foot_center[2]:.4f}]")
+
+        # Status reporting interval in ticks
+        status_interval = int(self.phase_cfg.STATUS_INTERVAL / self.ctrl_dt)
+
+        # Get IK iteration count for tracking mode
+        ik_tracking_iter = cfg.IK.TRACKING_ITERATIONS
 
         for tick in range(n_ticks):
             # --- Compute smooth interpolation factor ---
@@ -292,14 +322,14 @@ class VisualizedPhaseManager:
             # configurations the robot can never achieve.
             self.ik.sync_from_sim(self.data.qpos)
 
-            # Solve IK with 3 iterations (fast, for real-time tracking)
-            # n_iter=3: fewer iterations because we sync every tick anyway.
+            # Solve IK with tracking iterations (fast, for real-time tracking)
+            # Fewer iterations because we sync every tick anyway.
             # The small residual error is corrected next tick.
-            q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=3)
+            q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=ik_tracking_iter)
             self.step_sim(q_target)
 
-            # Report every 0.5s
-            if tick % int(0.5 / self.ctrl_dt) == 0:
+            # Report at configured interval
+            if tick % status_interval == 0:
                 status = self.monitor.snapshot(self.data, "BALANCE", tick, com_target)
                 self.monitor.print_status(status)
                 if self.monitor.is_fallen(self.data):
@@ -309,31 +339,34 @@ class VisualizedPhaseManager:
             if not self.viewer.is_running():
                 return False
 
-            # 0.3x real-time pacing (faster than real-time for quicker setup)
-            time.sleep(self.ctrl_dt * 0.3)
+            # Configurable real-time pacing
+            time.sleep(self.ctrl_dt * self.phase_cfg.BALANCE_PACE)
 
         com = self.robot.get_com(self.data)
         fc = self.robot.get_foot_center(self.data)
         print(f"  BALANCE COMPLETE: h={com[2]:.4f}, xy_err={np.linalg.norm(com[:2]-fc[:2]):.4f}")
-        return com[2] > 0.35
+        return com[2] > self.robot_cfg.MIN_STANDING_HEIGHT
 
     # ============================
     # PHASE 3: Stability hold
     # ============================
-    def phase_stability_hold(self, duration: float = 3.0) -> bool:
+    def phase_stability_hold(self, duration: float = None) -> bool:
         """
         Hold the balanced position and verify the robot doesn't drift or fall.
 
         This is a sanity check before starting ZMP control.
-        If the robot can't hold still for 3 seconds, ZMP sway will definitely fail.
+        If the robot can't hold still for the configured time, ZMP sway will definitely fail.
 
         Parameters:
             duration: float [seconds] - hold duration
-                     3.0s is enough to detect slow drift or oscillation buildup.
+                     Default from config. Enough to detect slow drift or oscillation buildup.
 
         Returns:
             bool: True if stable throughout, False if fallen.
         """
+        if duration is None:
+            duration = self.phase_cfg.STABILITY_HOLD_TIME
+
         print("\n" + "="*60)
         print("  PHASE 3: STABILITY HOLD")
         print("="*60)
@@ -353,13 +386,19 @@ class VisualizedPhaseManager:
         n_ticks = int(duration / self.ctrl_dt)
         max_drift = 0.0  # Track worst-case XY drift
 
+        # Status reporting interval in ticks
+        status_interval = int(self.phase_cfg.STATUS_INTERVAL / self.ctrl_dt)
+
+        # Get IK iteration count for tracking mode
+        ik_tracking_iter = cfg.IK.TRACKING_ITERATIONS
+
         for tick in range(n_ticks):
             # Track mode: sync every tick, solve, apply
             self.ik.sync_from_sim(self.data.qpos)
-            q_target = self.ik.solve(hold_target, dt=self.ctrl_dt, n_iter=3)
+            q_target = self.ik.solve(hold_target, dt=self.ctrl_dt, n_iter=ik_tracking_iter)
             self.step_sim(q_target)
 
-            if tick % int(0.5 / self.ctrl_dt) == 0:
+            if tick % status_interval == 0:
                 status = self.monitor.snapshot(self.data, "HOLD", tick, hold_target)
                 self.monitor.print_status(status)
                 max_drift = max(max_drift, status.xy_error)
@@ -371,7 +410,7 @@ class VisualizedPhaseManager:
             if not self.viewer.is_running():
                 return False
 
-            time.sleep(self.ctrl_dt * 0.3)
+            time.sleep(self.ctrl_dt * self.phase_cfg.HOLD_PACE)
 
         print(f"  HOLD COMPLETE: max XY drift = {max_drift:.4f}m")
         return True
@@ -379,9 +418,9 @@ class VisualizedPhaseManager:
     # ============================
     # PHASE 4: ZMP Preview Sway
     # ============================
-    def phase_zmp_sway(self, duration: float = 40.0,
-                       amplitude: float = 0.02,
-                       frequency: float = 0.2) -> bool:
+    def phase_zmp_sway(self, duration: float = None,
+                       amplitude: float = None,
+                       frequency: float = None) -> bool:
         """
         Run ZMP preview control with lateral (Y-axis) sway.
 
@@ -391,24 +430,33 @@ class VisualizedPhaseManager:
 
         Parameters:
             duration: float [seconds] - total sway time
-                     40s gives ~8 full sway cycles at 0.2Hz.
+                     Default from config. Gives multiple full sway cycles.
 
             amplitude: float [meters] - peak lateral sway distance
-                      0.02m (2cm) is conservative — well within support polygon.
+                      Default from config. Conservative start — well within support polygon.
                       G1 foot width ~0.08m each, stance ~0.2m.
                       Support polygon half-width ~0.14m.
-                      0.02m << 0.14m → very safe.
+                      Default << 0.14m → very safe.
                       Can increase to 0.04-0.06m for more dramatic motion.
 
             frequency: float [Hz] - sway oscillation frequency
-                      0.2 Hz = one full cycle every 5 seconds.
+                      Default from config.
                       Natural pendulum frequency for h=0.7m: sqrt(g/h) / (2π) ≈ 0.6Hz
-                      0.2Hz is well below resonance → smooth, easy to track.
+                      Default is well below resonance → smooth, easy to track.
                       Higher freq (0.5Hz) needs more aggressive control.
 
         Returns:
             bool: True if completed without falling, False otherwise.
         """
+        # Get defaults from config
+        zmp_cfg = cfg.ZMP
+        if duration is None:
+            duration = self.phase_cfg.ZMP_SWAY_DURATION
+        if amplitude is None:
+            amplitude = zmp_cfg.SWAY_AMPLITUDE
+        if frequency is None:
+            frequency = zmp_cfg.SWAY_FREQUENCY
+
         print("\n" + "="*60)
         print("  PHASE 4: ZMP PREVIEW CONTROL")
         print(f"  amplitude={amplitude*100:.1f}cm, freq={frequency:.2f}Hz, "
@@ -428,8 +476,10 @@ class VisualizedPhaseManager:
         # Create separate ZMP controllers for X and Y axes
         # X: sagittal (forward/backward) — held constant (no walking yet)
         # Y: lateral (side-to-side) — sway oscillation
-        zmp_x = ZMPPreviewController(z_c=z_c, dt=self.ctrl_dt)
-        zmp_y = ZMPPreviewController(z_c=z_c, dt=self.ctrl_dt)
+        zmp_x = ZMPPreviewController(z_c=z_c, dt=self.ctrl_dt,
+                                      preview_time=zmp_cfg.PREVIEW_TIME)
+        zmp_y = ZMPPreviewController(z_c=z_c, dt=self.ctrl_dt,
+                                      preview_time=zmp_cfg.PREVIEW_TIME)
         # Initialize both controllers at current CoM position
         zmp_x.reset(com[0])
         zmp_y.reset(com[1])
@@ -447,14 +497,14 @@ class VisualizedPhaseManager:
         ref_y = np.full(total, com[1])
 
         # ramp_start: time before sway begins [seconds]
-        # 2.0s pause lets the ZMP controller stabilize its internal state
+        # Pause lets the ZMP controller stabilize its internal state
         # before receiving non-constant references.
-        ramp_start = 2.0
+        ramp_start = zmp_cfg.SWAY_RAMP_START
 
         # ramp_dur: time to reach full amplitude [seconds]
-        # 3.0s gives a gentle increase. Instant full amplitude would shock
+        # Gives a gentle increase. Instant full amplitude would shock
         # the controller (like a step input → overshoot).
-        ramp_dur = 3.0
+        ramp_dur = zmp_cfg.SWAY_RAMP_DURATION
 
         for i in range(total):
             t = i * self.ctrl_dt
@@ -469,6 +519,11 @@ class VisualizedPhaseManager:
 
         print(f"  Starting ZMP control loop ({n_ticks} ticks, {duration:.0f}s)...")
 
+        # Get IK sync interval from config
+        ik_sync_interval = self.ctrl_cfg.IK_SYNC_INTERVAL
+        # Get IK iteration count for dynamic tracking
+        ik_default_iter = cfg.IK.DEFAULT_ITERATIONS
+
         for tick in range(n_ticks):
             t_start = time.time()
 
@@ -482,17 +537,17 @@ class VisualizedPhaseManager:
             com_target = np.array([com_x, com_y, z_c])
 
             # --- IK solve ---
-            # Sync with simulation every 2 ticks (20ms)
+            # Sync with simulation at configured interval
             # Every tick (10ms) would be ideal but is computationally wasteful
             # since the robot barely moves in one physics sub-step.
-            # Every 2 ticks is a good tradeoff.
-            if tick % 2 == 0:
+            # Configured interval is a good tradeoff.
+            if tick % ik_sync_interval == 0:
                 self.ik.sync_from_sim(self.data.qpos)
 
-            # n_iter=5: More iterations than balance phase because the
+            # More iterations than balance phase because the
             # CoM target is now actively moving. Need better convergence
             # to track the dynamic reference accurately.
-            q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=5)
+            q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=ik_default_iter)
 
             # Step simulation with the IK-solved target
             self.step_sim(q_target, sync_viewer=True, realtime=False)

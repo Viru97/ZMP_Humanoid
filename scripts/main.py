@@ -3,10 +3,12 @@ import mujoco.viewer
 import time
 import os
 import sys
+from typing import Tuple
 
 # Import custom modules
 from robot_model import G1RobotModel
 from phase_manager import VisualizedPhaseManager
+from config import cfg
 
 try:
     from robot_descriptions import g1_mj_description
@@ -38,6 +40,12 @@ def load_g1_model() -> Tuple[mujoco.MjModel, mujoco.MjData]:
     model_dir = os.path.dirname(xml_path)
     xml_file = os.path.basename(xml_path)
 
+    # Get simulation parameters from config
+    sim_cfg = cfg.SIMULATION
+    gravity = sim_cfg.GRAVITY
+    ground_friction = sim_cfg.GROUND_FRICTION
+    ground_solref = sim_cfg.GROUND_SOLREF
+
     # Scene XML wraps the robot model and adds environment
     scene_xml = f"""
     <mujoco model="g1_zmp_scene">
@@ -46,13 +54,13 @@ def load_g1_model() -> Tuple[mujoco.MjModel, mujoco.MjData]:
 
         <!-- Physics solver options -->
         <option 
-            timestep="0.001"
-            iterations="50"
-            solver="Newton"
-            tolerance="1e-10"
-            gravity="0 0 -9.81"
-            cone="elliptic"
-            impratio="10"
+            timestep="{sim_cfg.DT}"
+            iterations="{sim_cfg.SOLVER_ITERATIONS}"
+            solver="{sim_cfg.SOLVER_TYPE}"
+            tolerance="{sim_cfg.SOLVER_TOLERANCE}"
+            gravity="{gravity[0]} {gravity[1]} {gravity[2]}"
+            cone="{sim_cfg.CONE_TYPE}"
+            impratio="{sim_cfg.IMPRATIO}"
         />
         <!--
         timestep: Physics step size [seconds]. 0.001s (1kHz) is standard for
@@ -92,8 +100,8 @@ def load_g1_model() -> Tuple[mujoco.MjModel, mujoco.MjData]:
             <geom name="ground" type="plane" size="10 10 0.1" 
                   rgba="0.75 0.85 0.75 1"
                   contype="1" conaffinity="1"
-                  friction="1.0 0.005 0.001"
-                  solref="0.004 1"
+                  friction="{ground_friction[0]} {ground_friction[1]} {ground_friction[2]}"
+                  solref="{ground_solref[0]} {ground_solref[1]}"
             />
             <!--
             type="plane": Infinite ground plane (size only affects rendering).
@@ -129,7 +137,7 @@ def load_g1_model() -> Tuple[mujoco.MjModel, mujoco.MjData]:
             <body name="marker_ref_zmp" mocap="true">
                 <geom type="sphere" size="0.025" rgba="0 0 1 0.8" contype="0" conaffinity="0"/>
             </body>
-            
+
             <!-- Support Polygon Markers (Pads under feet) -->
             <body name="marker_lf" mocap="true">
                 <geom type="box" size="0.08 0.04 0.005" rgba="1 1 0 0.4" contype="0" conaffinity="0"/>
@@ -163,12 +171,12 @@ def load_g1_model() -> Tuple[mujoco.MjModel, mujoco.MjData]:
     print(f"  Timestep: {model.opt.timestep}s")
     print(f"  Initial CoM height: {h:.4f}m")
 
-    if h < 0.3:
+    if h < cfg.ROBOT.FALL_HEIGHT_THRESHOLD:
         # If model's default has robot at ground level, raise the floating base.
         # qpos[2] = base Z position for floating-base robots.
-        # 0.75m puts G1's feet approximately at ground level.
-        print(f"  Raising base to 0.75m (model default too low)...")
-        data.qpos[2] = 0.75
+        # Initial height puts G1's feet approximately at ground level.
+        print(f"  Raising base to {cfg.ROBOT.INITIAL_BASE_HEIGHT}m (model default too low)...")
+        data.qpos[2] = cfg.ROBOT.INITIAL_BASE_HEIGHT
         mujoco.mj_forward(model, data)
         mujoco.mj_comPos(model, data)
         print(f"  Adjusted CoM height: {data.subtree_com[0][2]:.4f}m")
@@ -211,35 +219,38 @@ def main():
 
     with mujoco.viewer.launch_passive(model, data) as viewer:
         # --- Configure camera for good initial view ---
+        vis_cfg = cfg.VISUALIZATION
+
         # distance: How far camera is from lookat point [meters]
         #   2.5m shows full robot with some surrounding context
-        viewer.cam.distance = 2.5
+        viewer.cam.distance = vis_cfg.CAMERA_DISTANCE
 
         # azimuth: Horizontal rotation around lookat [degrees]
         #   135° gives a 3/4 view (not pure front/side)
-        viewer.cam.azimuth = 135
+        viewer.cam.azimuth = vis_cfg.CAMERA_AZIMUTH
 
         # elevation: Vertical angle [degrees, negative = looking down]
         #   -20° looks slightly downward at the robot
-        viewer.cam.elevation = -20
+        viewer.cam.elevation = vis_cfg.CAMERA_ELEVATION
 
         # lookat: Point the camera is centered on [x, y, z] meters
         #   [0, 0, 0.7] = roughly chest height of standing G1
-        viewer.cam.lookat[:] = [0, 0, 0.7]
+        viewer.cam.lookat[:] = vis_cfg.CAMERA_LOOKAT
 
         # Sync viewer to show initial configuration before any stepping
         viewer.sync()
 
         # Brief pause so user can see the initial state
-        time.sleep(1.0)
+        time.sleep(vis_cfg.INITIAL_PAUSE)
 
         # Create phase manager (owns all control logic)
         manager = VisualizedPhaseManager(model, data, viewer)
 
         # === RUN PHASES SEQUENTIALLY ===
+        phase_cfg = cfg.PHASE
 
-        # Phase 1: Settle (3 seconds)
-        if not manager.phase_settle(duration=7.0):
+        # Phase 1: Settle
+        if not manager.phase_settle(duration=phase_cfg.SETTLE_TIME):
             print("\n*** PHASE 1 FAILED: Robot cannot stand with default control ***")
             print("    Possible fixes:")
             print("    - Check if model has proper actuator definitions")
@@ -249,8 +260,8 @@ def main():
             _wait_for_viewer(viewer)
             return
 
-        # Phase 2: Balance over feet (6 seconds)
-        if not manager.phase_balance(duration=10.0):
+        # Phase 2: Balance over feet
+        if not manager.phase_balance(duration=phase_cfg.BALANCE_TIME):
             print("\n*** PHASE 2 FAILED: Could not achieve CoM over feet ***")
             print("    Possible fixes:")
             print("    - Reduce IK aggressiveness (lower kp_com in WholeBodyIK.solve)")
@@ -260,8 +271,8 @@ def main():
             _wait_for_viewer(viewer)
             return
 
-        # Phase 3: Hold and verify (3 seconds)
-        if not manager.phase_stability_hold(duration=5.0):
+        # Phase 3: Hold and verify
+        if not manager.phase_stability_hold(duration=phase_cfg.STABILITY_HOLD_TIME):
             print("\n*** PHASE 3 FAILED: Not stable enough for ZMP control ***")
             print("    Possible fixes:")
             print("    - Increase phase 2 duration for better convergence")
@@ -272,10 +283,11 @@ def main():
 
         # Phase 4: ZMP sway!
         print("\n  All stability phases passed! Starting ZMP sway...")
+        zmp_cfg = cfg.ZMP
         manager.phase_zmp_sway(
-            duration=40.0,  # 40 seconds of sway
-            amplitude=0.02,  # 2cm lateral sway (conservative start)
-            frequency=0.2  # 0.2 Hz = 5 second period
+            duration=phase_cfg.ZMP_SWAY_DURATION,
+            amplitude=zmp_cfg.SWAY_AMPLITUDE,
+            frequency=zmp_cfg.SWAY_FREQUENCY
         )
 
         # Keep viewer open after completion so user can inspect final state
@@ -291,9 +303,9 @@ def _wait_for_viewer(viewer):
     print("  (Close viewer window to exit)")
     while viewer.is_running():
         viewer.sync()
-        # 50ms sleep = 20fps update rate for idle viewer
+        # Sleep time from config for idle viewer
         # Low enough to be responsive to user closing window
-        time.sleep(0.01)
+        time.sleep(cfg.VISUALIZATION.IDLE_SLEEP)
 
 
 # ================================================================

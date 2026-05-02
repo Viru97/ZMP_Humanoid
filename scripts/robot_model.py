@@ -1,6 +1,9 @@
 import mujoco
 from dataclasses import dataclass
+from typing import List, Optional
 import numpy as np
+from config import cfg
+
 
 @dataclass
 class g1BodyIDs:
@@ -36,16 +39,15 @@ class G1RobotModel:
         # nu: Number of actuators (motors)
         self.nu = model.nu
 
+        # Get robot configuration from config
+        robot_cfg = cfg.ROBOT
+
         # --- Find foot bodies ---
         # These are the bodies whose poses we constrain in IK to keep feet planted.
         # We search by name patterns common in humanoid models.
         # The ankle_roll_link is typically the lowest link before the foot sole.
-        self.left_foot_id = self._find_body([
-            'left_ankle_roll_link', 'left_ankle_link', 'left_foot'
-        ])
-        self.right_foot_id = self._find_body([
-            'right_ankle_roll_link', 'right_ankle_link', 'right_foot'
-        ])
+        self.left_foot_id = self._find_body(list(robot_cfg.LEFT_FOOT_CANDIDATES))
+        self.right_foot_id = self._find_body(list(robot_cfg.RIGHT_FOOT_CANDIDATES))
 
         if self.left_foot_id < 0 or self.right_foot_id < 0:
             print("  WARNING: Foot bodies not found! Listing all bodies:")
@@ -82,14 +84,14 @@ class G1RobotModel:
         # kp: Proportional gain [Nm/rad]. Higher → stiffer tracking.
         # kd: Derivative gain [Nm*s/rad]. Higher → more damping (less oscillation).
         # Only used if actuators are torque-type. Position servos have built-in PD.
-        self.kp = np.full(model.nu, 200.0)  # Default: moderate stiffness
-        self.kd = np.full(model.nu, 20.0)   # Default: moderate damping
+        self.kp = np.full(model.nu, robot_cfg.KP_JOINT_DEFAULT)  # Default: moderate stiffness
+        self.kd = np.full(model.nu, robot_cfg.KD_JOINT_DEFAULT)  # Default: moderate damping
         if not self.is_position_controlled:
             self._set_joint_gains()
 
         self._print_info()
 
-    def _find_body(self, candidates: list) -> int:
+    def _find_body(self, candidates: List[str]) -> int:
         """
         Search for a body by name from a list of candidates.
         Case-insensitive partial matching.
@@ -140,15 +142,18 @@ class G1RobotModel:
         Set per-joint PD gains for torque control mode.
 
         Different joint groups need different gains:
-        - Hip/Knee: High gains (400/40) — large masses, need stiffness for balance
-        - Ankle: Medium-high (300/30) — critical for balance but lower inertia
-        - Waist/Torso: Medium (200/20) — upper body stability
-        - Arms/Hands: Low (80/8) — low inertia, don't need to be stiff
+        - Hip/Knee: High gains — large masses, need stiffness for balance
+        - Ankle: Medium-high — critical for balance but lower inertia
+        - Waist/Torso: Medium — upper body stability
+        - Arms/Hands: Low — low inertia, don't need to be stiff
 
         The ratio kd/kp ≈ 0.1 gives critical damping for typical joint inertias.
         Underdamped (kd too low) → oscillations.
         Overdamped (kd too high) → sluggish response.
         """
+        # Get gains from config
+        robot_cfg = cfg.ROBOT
+
         for i in range(self.model.nu):
             jnt_id = self.act_to_jnt[i]
             if jnt_id < 0:
@@ -156,15 +161,15 @@ class G1RobotModel:
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id) or ""
             nl = name.lower()
             if 'hip' in nl:
-                self.kp[i], self.kd[i] = 400.0, 40.0
+                self.kp[i], self.kd[i] = robot_cfg.KP_HIP, robot_cfg.KD_HIP
             elif 'knee' in nl:
-                self.kp[i], self.kd[i] = 400.0, 40.0
+                self.kp[i], self.kd[i] = robot_cfg.KP_KNEE, robot_cfg.KD_KNEE
             elif 'ankle' in nl:
-                self.kp[i], self.kd[i] = 300.0, 30.0
+                self.kp[i], self.kd[i] = robot_cfg.KP_ANKLE, robot_cfg.KD_ANKLE
             elif 'waist' in nl or 'torso' in nl:
-                self.kp[i], self.kd[i] = 200.0, 20.0
+                self.kp[i], self.kd[i] = robot_cfg.KP_WAIST, robot_cfg.KD_WAIST
             else:
-                self.kp[i], self.kd[i] = 80.0, 8.0
+                self.kp[i], self.kd[i] = robot_cfg.KP_ARM, robot_cfg.KD_ARM
 
     def _list_bodies(self):
         """Print all body names for debugging model structure."""

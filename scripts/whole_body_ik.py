@@ -1,6 +1,8 @@
 import mujoco
 import numpy as np
+from typing import Optional
 from robot_model import G1RobotModel
+from config import cfg
 
 
 # ================================================================
@@ -54,6 +56,9 @@ class WholeBodyIK:
         # Flag: solver won't run until sync_from_sim is called
         self._ready = False
 
+        # Get IK configuration from config
+        self.ik_cfg = cfg.IK
+
     def sync_from_sim(self, qpos: np.ndarray):
         """
         Synchronize IK planner state from actual simulation.
@@ -103,7 +108,7 @@ class WholeBodyIK:
         self.q_ref = self.q_plan.copy()
 
     def solve(self, com_target: np.ndarray, dt: float = 0.01,
-              n_iter: int = 5) -> np.ndarray:
+              n_iter: int = None) -> np.ndarray:
         """
         Solve IK: find joint angles placing CoM at com_target with feet fixed.
 
@@ -122,11 +127,14 @@ class WholeBodyIK:
                 Larger dt → larger steps per iteration → faster convergence but less stable
             n_iter: int - number of Gauss-Newton iterations
                 More iterations → better convergence but more computation.
-                3-5 is typical for real-time control.
+                Default from config.IK.DEFAULT_ITERATIONS is typical for real-time control.
 
         Returns:
             np.ndarray, shape (nq,) - solved joint configuration
         """
+        if n_iter is None:
+            n_iter = self.ik_cfg.DEFAULT_ITERATIONS
+
         if not self._ready:
             return self.q_plan.copy()
 
@@ -141,6 +149,19 @@ class WholeBodyIK:
         # Smaller → more conservative steps, better stability
         # Total displacement ≈ velocity * dt (split across n_iter sub-steps)
         sub_dt = dt / max(n_iter, 1)
+
+        # Get IK parameters from config
+        kp_fp = self.ik_cfg.KP_FOOT_POSITION
+        kp_fr = self.ik_cfg.KP_FOOT_ROTATION
+        kp_com = self.ik_cfg.KP_COM
+
+        w_fp = self.ik_cfg.WEIGHT_FOOT_POSITION
+        w_fr = self.ik_cfg.WEIGHT_FOOT_ROTATION
+        w_com = self.ik_cfg.WEIGHT_COM
+
+        damping = self.ik_cfg.DAMPING
+        reg_weight = self.ik_cfg.JOINT_REG_WEIGHT
+        max_vel = self.ik_cfg.MAX_JOINT_VELOCITY
 
         for _ in range(n_iter):
             # Update forward kinematics to get current body poses and CoM
@@ -187,19 +208,18 @@ class WholeBodyIK:
             # v_des = kp * error  (proportional feedback in task space)
             # Higher kp → faster convergence but may overshoot
             #
-            # kp_fp = 200.0: Foot position gain [1/s]
+            # kp_fp: Foot position gain [1/s]
             #   High because feet MUST stay planted (ground contact)
             #   200 means: 1cm error → 2 m/s desired correction velocity
             #
-            # kp_fr = 100.0: Foot rotation gain [1/s]
+            # kp_fr: Foot rotation gain [1/s]
             #   High but less than position — orientation drift is less critical
             #   100 means: 0.01 rad error → 1 rad/s desired correction
             #
-            # kp_com = 60.0: CoM gain [1/s]
+            # kp_com: CoM gain [1/s]
             #   Lower than feet — CoM can move more slowly because it's the
             #   tracking target, not a hard constraint.
             #   60 means: 1cm error → 0.6 m/s desired correction
-            kp_fp, kp_fr, kp_com = 200.0, 100.0, 60.0
 
             # Stack all desired velocities into one vector [15]
             # Order: [lf_pos(3), lf_rot(3), rf_pos(3), rf_rot(3), com(3)]
@@ -216,16 +236,16 @@ class WholeBodyIK:
             # W [15 x 15]: diagonal weight matrix for task priority
             # Higher weight → that task is more important in the optimization.
             #
-            # Foot position: 2000 — HIGHEST priority (must maintain ground contact)
-            # Foot rotation: 800 — High (prevent foot from tilting/twisting)
-            # CoM: 200 — Lower (it's okay to sacrifice small CoM accuracy
+            # Foot position: HIGHEST priority (must maintain ground contact)
+            # Foot rotation: High (prevent foot from tilting/twisting)
+            # CoM: Lower (it's okay to sacrifice small CoM accuracy
             #            to keep feet perfectly planted)
             #
-            # Ratio matters: foot_pos/com = 2000/200 = 10x priority for feet
+            # Ratio matters: foot_pos/com = priority for feet over CoM
             W = np.diag(
-                [2000.0]*3 + [800.0]*3 +   # Left foot: pos + rot
-                [2000.0]*3 + [800.0]*3 +   # Right foot: pos + rot
-                [200.0]*3                    # CoM
+                [w_fp]*3 + [w_fr]*3 +   # Left foot: pos + rot
+                [w_fp]*3 + [w_fr]*3 +   # Right foot: pos + rot
+                [w_com]*3                 # CoM
             )
 
             # --- Posture regularization ---
@@ -243,10 +263,10 @@ class WholeBodyIK:
             q_err[:6] = 0.0
 
             # W_reg [nv x nv]: regularization weight per DOF
-            # 5.0: Mild pull toward reference (doesn't overwhelm main tasks)
+            # Mild pull toward reference (doesn't overwhelm main tasks)
             # If too high: CoM tracking suffers because joints can't move
             # If too low: arms/waist may drift to extreme positions
-            W_reg = np.eye(self.nv) * 5.0
+            W_reg = np.eye(self.nv) * reg_weight
             # Zero out floating base regularization — base must be free
             W_reg[:6, :6] = 0.0
 
@@ -257,12 +277,11 @@ class WholeBodyIK:
             # H = J'*W*J + damping*I + W_reg
             # g = J'*W*v_des + W_reg*q_err
             #
-            # damping = 5e-3: Tikhonov regularization [unit: 1/s²]
+            # damping: Tikhonov regularization [unit: 1/s²]
             #   Prevents singular/ill-conditioned solutions near kinematic singularities.
             #   Too small (1e-6) → near-singular solutions, joint velocity explosions
             #   Too large (1.0) → sluggish, can't reach targets
-            #   5e-3 is a good balance for humanoids with ~30 DOF.
-            damping = 5e-3
+            #   Default from config is a good balance for humanoids with ~30 DOF.
             H = J_stack.T @ W @ J_stack + damping * np.eye(self.nv) + W_reg
             g = J_stack.T @ W @ v_des + W_reg @ q_err
 
@@ -271,11 +290,10 @@ class WholeBodyIK:
             dq = np.linalg.solve(H, g)
 
             # --- Velocity clamp ---
-            # max_vel = 4.0 [rad/s]: Maximum allowed joint velocity
+            # max_vel: Maximum allowed joint velocity
             # Prevents unrealistic motions that the real robot couldn't achieve.
             # Also improves numerical stability of integration.
             # 4 rad/s ≈ 230 deg/s — fast but physically plausible for a humanoid.
-            max_vel = 4.0
             scale = np.max(np.abs(dq))
             if scale > max_vel:
                 dq *= max_vel / scale
@@ -358,4 +376,3 @@ class WholeBodyIK:
                 adr = self.model.jnt_qposadr[j]  # Index into qpos array
                 lo, hi = self.model.jnt_range[j]   # [lower_limit, upper_limit] in rad or m
                 self.ik_data.qpos[adr] = np.clip(self.ik_data.qpos[adr], lo, hi)
-

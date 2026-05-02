@@ -1,6 +1,7 @@
 import mujoco
 import numpy as np
 from robot_model import G1RobotModel
+from config import cfg
 
 
 # ================================================================
@@ -23,9 +24,11 @@ class JointController:
     def __init__(self, robot: G1RobotModel):
         self.robot = robot
         self.model = robot.model
+        # Get default torque limit from config
+        self.default_torque_limit = cfg.ROBOT.MAX_TORQUE
 
     def set_targets_from_qpos(self, data: mujoco.MjData, q_target: np.ndarray,
-                              torque_limit: float = 150.0):
+                              torque_limit: float = None):
         """
         Command all actuators to track q_target.
 
@@ -35,8 +38,11 @@ class JointController:
                       (only actuated joints are used; floating base entries ignored)
             torque_limit: float [Nm] - maximum torque per joint (torque mode only)
                          Prevents instability from PD overshoot.
-                         150 Nm is conservative for G1-sized joints.
+                         Default from config.ROBOT.MAX_TORQUE is conservative for G1-sized joints.
         """
+        if torque_limit is None:
+            torque_limit = self.default_torque_limit
+
         if self.robot.is_position_controlled:
             self._position_ctrl(data, q_target)
         else:

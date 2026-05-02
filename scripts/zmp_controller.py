@@ -1,5 +1,7 @@
 import numpy as np
 import scipy.linalg
+from typing import Tuple
+from config import cfg
 
 
 # ================================================================
@@ -22,21 +24,34 @@ class ZMPPreviewController:
             Used in LIPM equation: zmp = com_pos - (z_c/g) * com_accel.
             Higher z_c means larger pendulum → slower natural dynamics.
             Typical humanoid: 0.5 - 0.9m.
+            Default from config.ZMP.Z_C.
 
         dt: float
             Control timestep [seconds].
             How often the controller updates. Must match the control loop rate.
             Typical: 0.005 - 0.02s (50-200 Hz).
+            Default from config.SIMULATION.CONTROL_DT.
 
         preview_time: float
             How far into the future the controller looks [seconds].
             Longer preview → smoother anticipatory motion, but more computation.
             Must be long enough to cover ~1 full step cycle.
             Typical: 1.0 - 2.0s for walking at 0.5-1.0 Hz step frequency.
-            Default: 1.6s
+            Default from config.ZMP.PREVIEW_TIME.
     """
 
-    def __init__(self, z_c: float, dt: float, preview_time: float = 1.6):
+    def __init__(self, z_c: float = None, dt: float = None, preview_time: float = None):
+        # Get defaults from config
+        zmp_cfg = cfg.ZMP
+        sim_cfg = cfg.SIMULATION
+
+        if z_c is None:
+            z_c = zmp_cfg.Z_C
+        if dt is None:
+            dt = sim_cfg.CONTROL_DT
+        if preview_time is None:
+            preview_time = zmp_cfg.PREVIEW_TIME
+
         self.dt = dt
         # N: Number of preview samples = preview_time / dt
         # e.g., 1.6s / 0.01s = 160 future reference points
@@ -44,7 +59,8 @@ class ZMPPreviewController:
 
         # g: Gravitational acceleration [m/s²]
         # Standard Earth gravity. Used in LIPM ZMP equation.
-        g = 9.81
+        # Get magnitude from config gravity vector (take absolute value of z component)
+        g = cfg.get_gravity_magnitude()
 
         # --- Continuous-time LIPM state-space ---
         # State: x = [position, velocity, jerk_integral(=acceleration)]
@@ -105,22 +121,25 @@ class ZMPPreviewController:
         A_tilde = np.hstack([I_tilde, F_tilde])
 
         # --- LQR (Linear Quadratic Regulator) design ---
+        # Get LQR weights from config
+        q_zmp_error = zmp_cfg.Q_ZMP_ERROR
+        r_jerk = zmp_cfg.R_JERK
+
         # Q: State cost matrix [4x4]
-        # Q[0,0] = 1e6: HEAVY penalty on ZMP tracking error integral.
+        # Q[0,0]: HEAVY penalty on ZMP tracking error integral.
         #   This forces the controller to aggressively eliminate steady-state error.
         #   Larger value → tighter ZMP tracking but more aggressive CoM motion.
         #   Typical range: 1e4 (loose) to 1e8 (very tight).
         # Q[1:,1:] = 0: No direct penalty on state (position/velocity/acceleration).
         #   We only care about the ZMP output, not the internal state values.
-        Q = np.diag([1e6, 0.0, 0.0, 0.0])
+        Q = np.diag([q_zmp_error, 0.0, 0.0, 0.0])
 
         # R: Input cost matrix [1x1]
-        # R = 1.0: Unit penalty on jerk (control effort).
+        # R: Penalty on jerk (control effort).
         #   Larger R → smoother motion (less jerk) but slower tracking.
         #   Smaller R → faster tracking but jerkier motion.
         #   The ratio Q[0,0]/R determines the aggressiveness.
-        #   Q/R = 1e6/1 = 1e6 → very responsive to ZMP error.
-        R = np.array([[1.0]])
+        R = np.array([[r_jerk]])
 
         # Solve Discrete Algebraic Riccati Equation (DARE)
         # P is the steady-state cost-to-go matrix.
