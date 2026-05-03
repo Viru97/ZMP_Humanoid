@@ -186,9 +186,9 @@ class ZMPControllerConfig:
     # Ratio Q[0,0]/R determines overall aggressiveness (default: 1e6)
 
     # Walking parameters (used by phase_manager and trajectory generation)
-    STEP_LENGTH: float = 0.15  # [m] target step length for walking gait
+    STEP_LENGTH: float = 0.03  # [m] target step length for walking gait (conservative)
     STEP_TIME: float = 0.6  # [s] time per step cycle (step frequency ≈ 1.67 Hz)
-    SWING_HEIGHT: float = 0.05  # [m] maximum foot swing height during walking
+    SWING_HEIGHT: float = 0.05  # [m] maximum foot swing height during walking (more visible)
 
     # Foot geometry for stability analysis
     FOOT_LENGTH: float = 0.16  # [m] foot length (anterior-posterior)
@@ -213,13 +213,17 @@ class ZMPControllerConfig:
 class PhaseManagerConfig:
     """Walking phase manager parameters for G1 robot locomotion."""
     # Phase timing (seconds)
-    SETTLE_TIME: float = 7.0  # Time to settle robot on ground after initialization
-    BALANCE_TIME: float = 15.0  # Time to maintain static balance before starting walk
+    SETTLE_TIME: float = 2.0  # Time to settle robot on ground after initialization
+    BALANCE_TIME: float = 2.0  # Time to maintain static balance before starting walk
     PREPARE_TIME: float = 0.3  # Time to prepare for next step (transition to single support)
     STEP_TIME: float = 0.6  # Duration of single support phase (stepping)
     DOUBLE_SUPPORT_TIME: float = 0.2  # Time in double support phase (both feet on ground)
-    STABILITY_HOLD_TIME: float = 5.0  # Time to hold and verify stability
-    ZMP_SWAY_DURATION: float = 40.0  # Duration of ZMP sway phase
+    STABILITY_HOLD_TIME: float = 2.0  # Time to hold and verify stability
+    ZMP_SWAY_DURATION: float = 5.0  # Duration of ZMP sway phase
+    # Phase 4 implementation mode:
+    # - "safe_sway": conservative joint-space sway fallback (recommended for G1 position servos)
+    # - "preview_ik": full preview + IK tracking path
+    PHASE4_MODE: str = "safe_sway"
 
     # Stability margins for COM (Center of Mass) control
     COM_X_MARGIN: float = 0.1  # [m] safety margin for COM X position relative to ZMP
@@ -236,6 +240,8 @@ class PhaseManagerConfig:
     SETTLE_PACE: float = 1.0  # Multiplier for settle phase (< 1 = faster than real-time)
     BALANCE_PACE: float = 1.0  # Multiplier for balance phase
     HOLD_PACE: float = 1.0  # Multiplier for stability hold phase
+    SWAY_PACE: float = 1.0  # Multiplier for ZMP sway phase
+    STEP_PACE: float = 1.0  # Multiplier for walking step phase
 
     # Status reporting interval
     STATUS_INTERVAL: float = 0.5  # [s] How often to print status during phases

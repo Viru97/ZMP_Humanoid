@@ -91,6 +91,15 @@ class StatusMonitor:
               f"FC=[{status.foot_center[0]:.3f},{status.foot_center[1]:.3f}] | "
               f"xy_err={status.xy_error:.4f} {status.extra}")
 
+    def base_tilt(self, data: mujoco.MjData) -> float:
+        """Return the free-base tilt angle in radians relative to upright."""
+        base_quat = data.qpos[3:7].copy()
+        rot_flat = np.zeros(9)
+        mujoco.mju_quat2Mat(rot_flat, base_quat)
+        rot = rot_flat.reshape(3, 3)
+        up_axis = rot[:, 2]
+        return float(np.arccos(np.clip(up_axis[2], -1.0, 1.0)))
+
     def is_fallen(self, data: mujoco.MjData, threshold: float = None) -> bool:
         """
         Check if robot has fallen.
@@ -104,7 +113,44 @@ class StatusMonitor:
         if threshold is None:
             threshold = self.fall_threshold
         com = self.robot.get_com(data)
-        return com[2] < threshold
+        base_height = float(data.qpos[2])
+        tilt = self.base_tilt(data)
+        return com[2] < 0.68 or base_height < 0.68 or tilt > 0.60
+
+    def support_margin(self, data: mujoco.MjData) -> float:
+        """
+        Approximate margin of the projected CoM to the foot support rectangle edges.
+
+        Returns the minimum distance (meters) from the CoM projection to the
+        nearest foot-edge along the sagittal (X) and lateral (Y) axes. Positive
+        means safely inside the support region; negative means outside.
+        """
+        mujoco.mj_kinematics(self.robot.model, data)
+        com = self.robot.get_com(data)
+        # Foot contact positions
+        lf = data.xpos[self.robot.left_foot_id][:2].copy()
+        rf = data.xpos[self.robot.right_foot_id][:2].copy()
+        fc = (lf + rf) / 2.0
+
+        dx = com[0] - fc[0]
+        dy = com[1] - fc[1]
+
+        half_x = cfg.ZMP.FOOT_LENGTH / 2.0
+        half_y = cfg.ZMP.FOOT_WIDTH / 2.0
+
+        margin_x = half_x - abs(dx)
+        margin_y = half_y - abs(dy)
+
+        return min(margin_x, margin_y)
+
+    def is_margin_critical(self, data: mujoco.MjData, thresh: float = None) -> bool:
+        """
+        Return True if the computed support margin is below configured safety thresholds.
+        """
+        if thresh is None:
+            # Use conservative threshold from phase config
+            thresh = min(cfg.PHASE.COM_X_MARGIN, cfg.PHASE.COM_Y_MARGIN)
+        return self.support_margin(data) < thresh
 
 
 # ================================================================
@@ -255,6 +301,60 @@ class VisualizedPhaseManager:
         # Update viewer display
         if sync_viewer and self.viewer.is_running():
             self.viewer.sync()
+
+    def _print_step_joint_diagnostics(self, q_target: np.ndarray, limit: int = 8,
+                                       show_all: bool = False):
+        """
+        Print actuator-space tracking diagnostics for the current step.
+
+        The G1 uses position-controlled actuators, so the meaningful "torque"
+        signal is the PD estimate from the commanded position error and joint
+        velocity.
+        """
+        rows = []
+        for act_id in range(self.robot.nu):
+            qpos_idx = self.robot.act_to_qpos[act_id]
+            dof_idx = self.robot.act_to_dof[act_id]
+            jnt_id = self.robot.act_to_jnt[act_id]
+            if qpos_idx < 0 or dof_idx < 0 or jnt_id < 0:
+                continue
+
+            joint_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id) or f"act_{act_id}"
+            q_current = float(self.data.qpos[qpos_idx])
+            q_desired = float(q_target[qpos_idx])
+            q_error = q_desired - q_current
+            q_velocity = float(self.data.qvel[dof_idx])
+
+            if self.robot.is_position_controlled:
+                kp = float(self.model.actuator_gainprm[act_id, 0])
+                kd = float(-self.model.actuator_biasprm[act_id, 2])
+                tau_est = kp * q_error - kd * q_velocity
+                ctrl_cmd = q_desired
+                tau_act = float(self.data.actuator_force[act_id])
+            else:
+                ctrl_cmd = float(self.data.ctrl[act_id])
+                tau_est = ctrl_cmd
+                tau_act = float(self.data.actuator_force[act_id])
+
+            rows.append((abs(q_error), joint_name, q_current, q_desired, q_error, q_velocity, ctrl_cmd, tau_est, tau_act))
+
+        if not rows:
+            return
+
+        rows.sort(key=lambda row: row[0], reverse=True)
+        selected = rows if show_all else rows[:limit]
+        print("    [STEP JOINTS] name                 q_cur     q_tgt     q_err     qd       cmd      tau_act")
+        for _, joint_name, q_current, q_desired, q_error, q_velocity, ctrl_cmd, tau_est, tau_act in selected:
+            print(
+                f"    [STEP JOINTS] {joint_name:20s} "
+                f"{q_current:+.4f}  {q_desired:+.4f}  {q_error:+.4f}  "
+                f"{q_velocity:+.4f}  {ctrl_cmd:+.4f}  {tau_act:+.2f}"
+            )
+
+        max_err = rows[0][0]
+        rms_err = float(np.sqrt(np.mean([row[4] ** 2 for row in rows])))
+        max_tau = max(abs(row[8]) for row in rows)
+        print(f"    [STEP JOINTS] max_err={max_err:.4f} rad | rms_err={rms_err:.4f} rad | max|tau|={max_tau:.2f}")
 
     # ============================
     # PHASE 1: Settle
@@ -538,18 +638,24 @@ class VisualizedPhaseManager:
 
         print("\n" + "="*60)
         print("  PHASE 4: ZMP PREVIEW CONTROL")
-        print(f"  amplitude={amplitude*100:.1f}cm, freq={frequency:.2f}Hz, "
-              f"duration={duration:.0f}s")
-        print("="*60)
-
-        # Finalize IK from current state
+        print(
+            f"  amplitude={amplitude*100:.1f}cm, freq={frequency:.2f}Hz, "
+            f"duration={duration:.0f}s"
+        )
+        print(f"  mode={self.phase_cfg.PHASE4_MODE}")
+        print("=" * 60)
         self.ik.sync_from_sim(self.data.qpos)
         self.ik.capture_foot_targets()
 
-        # Position-servo fallback: long-horizon IK in this phase is prone to
-        # drift/runaway on this G1 setup. Use a conservative joint-space sway.
-        if self.robot.is_position_controlled:
-            print("  [ZMP] Using position-servo fallback (waist-roll sway).")
+        mode = str(self.phase_cfg.PHASE4_MODE).strip().lower()
+        use_safe_sway = (mode == "safe_sway")
+        if mode not in ("safe_sway", "preview_ik"):
+            print(f"  [ZMP] Unknown mode '{self.phase_cfg.PHASE4_MODE}', falling back to safe_sway.")
+            use_safe_sway = True
+
+        # Safe sway mode: conservative joint-space sway fallback.
+        if use_safe_sway:
+            print("  [ZMP] Using safe_sway fallback (waist-roll sway).")
 
             def _find_joint_qpos_idx(name_tokens):
                 for j in range(self.model.njnt):
@@ -602,122 +708,211 @@ class VisualizedPhaseManager:
                         return False
 
                 if not self.viewer.is_running():
-                    print("  Viewer closed by user.")
-                    return True
+                    return False
 
-                time.sleep(self.ctrl_dt)
+                time.sleep(self.ctrl_dt * self.phase_cfg.SWAY_PACE)
 
-            print("  ZMP SWAY COMPLETE.")
-            return True
+        print("\n  ZMP SWAY COMPLETE.")
+        return True
 
-        # Get starting CoM position and height
-        com = self.robot.get_com(self.data)
-        foot_center = self.robot.get_foot_center(self.data)
-        # z_c: LIPM pendulum height — critical parameter for ZMP controller
-        # Must match actual CoM height for the LIPM model to be accurate.
-        z_c = com[2]
+    # ============================
+    # PHASE 5: Single Step Walking
+    # ============================
+    def phase_single_step(self, step_forward: float = 0.15, duration: float = 1.0) -> bool:
+        """
+        Execute a single forward step: right foot support, left foot swings forward.
 
-        # Create ZMP controller for Y axis only.
-        # For sway-only balance, sagittal (X) preview actuation is disabled to
-        # avoid exciting forward-fall modes in position-servo tracking.
-        zmp_y = ZMPPreviewController(z_c=z_c, dt=self.ctrl_dt,
-                                      preview_time=zmp_cfg.PREVIEW_TIME)
-        # Initialize controller at current lateral CoM position
-        zmp_y.reset(com[1])
+        Sequence:
+        1. Weight shift toward right foot (0-0.3s)
+        2. Swing left foot forward in arc (0-0.6s)
+        3. Land left foot, transition weight (0.6-1.0s)
 
-        # --- Generate ZMP reference trajectory ---
+        Parameters:
+            step_forward: float [meters] - horizontal step length (default 0.15m)
+            duration: float [seconds] - total step duration
+
+        Returns:
+            bool: True if step completed without falling
+        """
+        print("\n" + "="*60)
+        print(f"  PHASE 5: SINGLE STEP (forward={step_forward:.3f}m, duration={duration:.2f}s)")
+        print("="*60)
+
+        # Initialize IK from current state
+        self.ik.sync_from_sim(self.data.qpos)
+        mujoco.mj_kinematics(self.model, self.data)
+
+        # Get current foot positions
+        left_foot_id = self.robot.left_foot_id
+        right_foot_id = self.robot.right_foot_id
+        left_foot_pos = self.data.xipos[left_foot_id].copy()
+        right_foot_pos = self.data.xipos[right_foot_id].copy()
+
+        # Step parameters
         n_ticks = int(duration / self.ctrl_dt)
-        N_prev = zmp_y.N  # Preview horizon length
-        # Total samples needed: simulation ticks + preview buffer
-        total = n_ticks + N_prev
+        status_interval = max(1, int(self.phase_cfg.STATUS_INTERVAL / self.ctrl_dt))
+        ik_sync_interval = 5  # Sync every 5 ticks to reduce planner drift during weight-shift
 
-        # Y reference: sinusoidal sway with ramp-up
-        ref_y = np.full(total, com[1])
+        # Phase durations (as fractions of total time)
+        t_weight_shift = 0.35  # 35% of time: shift weight to right foot faster
+        t_swing = 0.75  # 75% of time: swing left foot forward
+        t_landing = 1.0  # 100% of time: complete landing and stabilize
 
-        # ramp_start: time before sway begins [seconds]
-        # Pause lets the ZMP controller stabilize its internal state
-        # before receiving non-constant references.
-        ramp_start = zmp_cfg.SWAY_RAMP_START
+        n_weight_shift = int(n_ticks * t_weight_shift)
+        n_swing_end = int(n_ticks * t_swing)
 
-        # ramp_dur: time to reach full amplitude [seconds]
-        # Gives a gentle increase. Instant full amplitude would shock
-        # the controller (like a step input → overshoot).
-        ramp_dur = zmp_cfg.SWAY_RAMP_DURATION
+        # Swing trajectory parameters
+        swing_height = cfg.ZMP.SWING_HEIGHT  # Maximum foot lift (default 0.05m)
+        ground_z = left_foot_pos[2]  # Landing height (current foot-body height)
 
-        for i in range(total):
-            t = i * self.ctrl_dt
-            if t > ramp_start:
-                # Ramp factor: 0 → 1 over ramp_dur seconds
-                ramp = min(1.0, (t - ramp_start) / ramp_dur)
-                # Smoothstep for jerk-free ramp
-                ramp = ramp * ramp * (3 - 2 * ramp)
-                # Sinusoidal ZMP reference: y0 + A*sin(2π*f*t)
-                ref_y[i] = com[1] + amplitude * ramp * np.sin(
-                    2.0 * np.pi * frequency * (t - ramp_start))
+        # Landing position: same Y, forward in X
+        left_landing_pos = left_foot_pos.copy()
+        left_landing_pos[0] += step_forward
 
-        print(f"  Starting ZMP control loop ({n_ticks} ticks, {duration:.0f}s)...")
+        # Initial state for blending
+        initial_com = self.robot.get_com(self.data)
+        mujoco.mj_kinematics(self.model, self.data)
+        foot_center = self.robot.get_foot_center(self.data)
 
-        # Get IK sync interval from config.
-        # For position servos, use moderate periodic sync to limit planner drift
-        # while preserving enough command error for servo torque generation.
-        ik_sync_interval = self.ctrl_cfg.IK_SYNC_INTERVAL
-        if self.robot.is_position_controlled:
-            ik_sync_interval = max(ik_sync_interval, 10)
-        # Get IK iteration count for dynamic tracking
-        ik_default_iter = cfg.IK.DEFAULT_ITERATIONS
+        # Bias the CoM target slightly inside the right foot so the step
+        # stays on the safe side of the support polygon estimate.
+        support_com_target = np.array([
+            right_foot_pos[0] - 0.005,
+            right_foot_pos[1] - 0.04,
+            initial_com[2]
+        ])
+
+        step_ik_iter = max(cfg.IK.TRACKING_ITERATIONS, 12)
+
+        print(f"  Initial COM: {initial_com}")
+        print(f"  Left foot  : {left_foot_pos}")
+        print(f"  Right foot : {right_foot_pos}")
+        print(f"  Landing pos: {left_landing_pos}")
+
+        # Keep the right foot planted throughout the step.
+        # The left foot target will be updated dynamically once swing begins.
+        self.ik.lf_pos_target = left_foot_pos.copy()
+        self.ik.lf_mat_target = self.data.xmat[left_foot_id].reshape(3, 3).copy()
+        self.ik.rf_pos_target = right_foot_pos.copy()
+        self.ik.rf_mat_target = self.data.xmat[right_foot_id].reshape(3, 3).copy()
 
         for tick in range(n_ticks):
-            t_start = time.time()
+            t = tick * self.ctrl_dt
+            t_norm = tick / max(n_ticks, 1)  # 0.0 to 1.0 progress
 
-            # --- ZMP preview controller step ---
-            # Feed the reference trajectory from current tick onward.
-            # The controller looks N_prev steps into the future.
-            # Returns: desired CoM position that will produce the desired ZMP.
-            com_y, _ = zmp_y.step(ref_y[tick:tick + N_prev])
-            # X and Z from current robot state, Y from preview controller.
-            # Holding Z fixed over-constrains IK with fixed feet and can induce falls.
-            com_now = self.robot.get_com(self.data)
-            com_target = np.array([com_now[0], com_y, com_now[2]])
+            # --- Phase 1: Weight shift (0 to t_weight_shift) ---
+            # Gradually move CoM from center toward right (support) foot
+            if tick < n_weight_shift:
+                ws_progress = tick / max(n_weight_shift, 1)
+                # Smoothstep for zero velocity at boundaries
+                ws_progress = ws_progress * ws_progress * (3.0 - 2.0 * ws_progress)
 
-            # --- IK solve ---
-            # Sync with simulation at configured interval
-            # Every tick (10ms) would be ideal but is computationally wasteful
-            # since the robot barely moves in one physics sub-step.
-            # Configured interval is a good tradeoff.
+                # Interpolate CoM from center toward right foot
+                com_target = np.array([
+                    (1.0 - ws_progress) * foot_center[0] + ws_progress * support_com_target[0],
+                    (1.0 - ws_progress) * foot_center[1] + ws_progress * support_com_target[1],
+                    initial_com[2]  # Maintain height
+                ])
+            # --- Phase 2 & 3: Swing and landing (t_weight_shift to end) ---
+            else:
+                # Swing progress: 0.0 to 1.0 over swing duration
+                swing_progress = (tick - n_weight_shift) / max(n_swing_end - n_weight_shift, 1)
+                swing_progress = np.clip(swing_progress, 0.0, 1.0)
+
+                # Foot trajectory during swing (kinematic, not IK-driven)
+                # Horizontal: linear interpolation from current to landing
+                left_foot_swing = left_foot_pos.copy()
+                left_foot_swing[0] = left_foot_pos[0] + swing_progress * step_forward
+                left_foot_swing[1] = left_foot_pos[1]  # No lateral motion
+
+                # Vertical: sinusoidal arc (rises then falls)
+                if swing_progress < 1.0:
+                    left_foot_swing[2] = ground_z + swing_height * np.sin(np.pi * swing_progress)
+                else:
+                    left_foot_swing[2] = ground_z  # Land
+
+                # Update the left foot target so IK actually swings the leg.
+                self.ik.lf_pos_target = left_foot_swing.copy()
+                self.ik.lf_mat_target = self.data.xmat[left_foot_id].reshape(3, 3).copy()
+
+                # CoM target: stay over right foot during swing
+                com_target = support_com_target.copy()
+
+                # Late in swing (> 80%), begin transitioning CoM toward center
+                if swing_progress > 0.8:
+                    transition_progress = (swing_progress - 0.8) / 0.2  # 0.0 to 1.0 over final 20%
+                    transition_progress = transition_progress * transition_progress * (3.0 - 2.0 * transition_progress)
+
+                    # Blend toward midpoint of new feet positions (left_landing, right)
+                    new_foot_center = (left_landing_pos + right_foot_pos) / 2.0
+                    com_target = np.array([
+                        (1.0 - transition_progress) * support_com_target[0] + transition_progress * new_foot_center[0],
+                        (1.0 - transition_progress) * support_com_target[1] + transition_progress * new_foot_center[1],
+                        initial_com[2]
+                    ])
+            # During weight shift, keep both feet pinned at their planted poses.
+            if tick < n_weight_shift:
+                self.ik.lf_pos_target = left_foot_pos.copy()
+                self.ik.lf_mat_target = self.data.xmat[left_foot_id].reshape(3, 3).copy()
+                self.ik.rf_pos_target = right_foot_pos.copy()
+                self.ik.rf_mat_target = self.data.xmat[right_foot_id].reshape(3, 3).copy()
+
+            # --- IK and simulation step ---
+            # Periodic sync for position servo stability
             if tick % ik_sync_interval == 0:
                 self.ik.sync_from_sim(self.data.qpos)
 
-            # More iterations than balance phase because the
-            # CoM target is now actively moving. Need better convergence
-            # to track the dynamic reference accurately.
-            q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=ik_default_iter)
+            # Solve IK for CoM target (feet stay where they are from current sim state)
+            q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=step_ik_iter)
+            self.step_sim(q_target, com_target=com_target)
 
-            # Step simulation with the IK-solved target
-            self.step_sim(q_target, sync_viewer=True, realtime=False,
-                          com_target=com_target,
-                          ref_zmp_xy=np.array([com_now[0], ref_y[tick]]))
-
-            # --- Monitoring ---
-            # Every 200 ticks (2.0s): detailed status print
-            if tick % 200 == 0:
-                status = self.monitor.snapshot(self.data, "ZMP", tick, com_target)
+            # --- Status reporting and fall detection ---
+            if tick % status_interval == 0:
+                status = self.monitor.snapshot(self.data, "STEP", tick, com_target)
                 self.monitor.print_status(status)
+                self._print_step_joint_diagnostics(q_target, limit=8, show_all=False)
+                lf_target = self.ik.lf_pos_target
+                rf_target = self.ik.rf_pos_target
+                lf_actual = self.data.xipos[left_foot_id]
+                rf_actual = self.data.xipos[right_foot_id]
+                print(
+                    f"    [STEP FEET] lf_act=[{lf_actual[0]:+.3f},{lf_actual[1]:+.3f},{lf_actual[2]:+.3f}] "
+                    f"lf_tgt=[{lf_target[0]:+.3f},{lf_target[1]:+.3f},{lf_target[2]:+.3f}]"
+                )
+                print(
+                    f"    [STEP FEET] rf_act=[{rf_actual[0]:+.3f},{rf_actual[1]:+.3f},{rf_actual[2]:+.3f}] "
+                    f"rf_tgt=[{rf_target[0]:+.3f},{rf_target[1]:+.3f},{rf_target[2]:+.3f}]"
+                )
+                # Check support margin to detect near-fall early
+                # During swing the robot is single-support on the right foot.
+                # Compute single-support margin w.r.t. the right foot to avoid
+                # treating the (lifted) left foot as part of the support polygon.
+                if tick < n_weight_shift:
+                    margin = self.monitor.support_margin(self.data)
+                else:
+                    mujoco.mj_kinematics(self.model, self.data)
+                    com_now = self.robot.get_com(self.data)
+                    dx = com_now[0] - right_foot_pos[0]
+                    dy = com_now[1] - right_foot_pos[1]
+                    half_x = cfg.ZMP.FOOT_LENGTH / 2.0
+                    half_y = cfg.ZMP.FOOT_WIDTH / 2.0
+                    margin_x = half_x - abs(dx)
+                    margin_y = half_y - abs(dy)
+                    margin = min(margin_x, margin_y)
+
+                print(f"    [STEP] support_margin={margin:.4f}m")
+                # Keep this as a diagnostic only; the rectangle estimate can be overly conservative.
+                if margin <= -0.05:
+                    print("  *** WARNING: support margin became too negative! ***")
                 if self.monitor.is_fallen(self.data):
-                    print("  *** FALLEN during ZMP control! ***")
+                    print("  *** FALLEN during step! ***")
+                    self._print_step_joint_diagnostics(q_target, limit=self.robot.nu, show_all=True)
                     return False
 
             if not self.viewer.is_running():
-                print("  Viewer closed by user.")
-                return True
+                return False
 
-            # --- Real-time pacing ---
-            # Try to maintain real-time: each tick should take ctrl_dt wall-clock seconds.
-            # If computation takes less, sleep the remainder.
-            # If computation takes more (IK too slow), don't sleep — run as fast as possible.
-            elapsed = time.time() - t_start
-            sleep_time = self.ctrl_dt - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            time.sleep(self.ctrl_dt * self.phase_cfg.STEP_PACE)
 
-        print("  ZMP SWAY COMPLETE.")
+        print(f"  SINGLE STEP COMPLETE.")
         return True

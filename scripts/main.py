@@ -291,6 +291,13 @@ def main():
             frequency=zmp_cfg.SWAY_FREQUENCY
         )
 
+        # Phase 5: Single step walking
+        print("\n  ZMP sway complete. Attempting single-step walking...")
+        if manager.phase_single_step(step_forward=zmp_cfg.STEP_LENGTH, duration=1.5):
+            print("\n*** SINGLE STEP SUCCESSFUL! ***")
+        else:
+            print("\n*** SINGLE STEP FAILED - robot could not complete step ***")
+
         # Keep viewer open after completion so user can inspect final state
         print("\n  Control complete. Viewer remains open.")
         _wait_for_viewer(viewer)
