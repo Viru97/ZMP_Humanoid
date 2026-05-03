@@ -229,7 +229,8 @@ class ZMPPreviewController:
         #   -K_I * err_sum:  Integral feedback (eliminate steady-state error)
         #   -K_x @ x:       State feedback (stabilize dynamics)
         #   -preview:        Feedforward from future references (anticipation)
-        u = -self.K_I * self.err_sum - (self.K_x @ self.x)[0, 0] - preview
+        state_feedback = float(np.dot(self.K_x, self.x[:, 0]))
+        u = -self.K_I * self.err_sum - state_feedback - preview
 
         # Propagate state: x(k+1) = Ad*x(k) + Bd*u(k)
         self.x = self.Ad @ self.x + self.Bd * u

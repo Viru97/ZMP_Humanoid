@@ -266,7 +266,8 @@ def main():
             print("    Possible fixes:")
             print("    - Reduce IK aggressiveness (lower kp_com in WholeBodyIK.solve)")
             print("    - Check foot body identification (see body list above)")
-            print("    - Verify IK is syncing with sim (sync_from_sim called every tick)")
+            print("    - Verify IK sync policy matches actuator type:")
+            print("      position servos: avoid per-tick sync; torque mode: frequent sync")
             print("    - Try longer duration or smaller alpha ramp")
             _wait_for_viewer(viewer)
             return

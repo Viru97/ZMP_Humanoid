@@ -1,8 +1,7 @@
 import mujoco
 import numpy as np
 from typing import Optional
-# from robot_model import G1RobotModel
-from robot_model import G1Model
+from g1_robot_model import G1RobotModel
 from config import cfg
 
 
@@ -26,7 +25,7 @@ class WholeBodyIK:
     - Iterative solver: multiple Gauss-Newton steps per call
     """
 
-    def __init__(self, robot: G1Model):
+    def __init__(self, robot: G1RobotModel):
         self.robot = robot
         self.model = robot.model
         # nv: Degrees of freedom (velocity-space dimension)
@@ -53,6 +52,15 @@ class WholeBodyIK:
         # q_ref: Reference pose for regularization
         # Joints are gently pulled toward this to prevent wild arm/waist motion
         self.q_ref = self.model.qpos0.copy()
+
+        # Actuated-DOF mask: IK is solved in full nv space, but only actuated
+        # DOFs can be realized by the joint controller in simulation.
+        self.actuated_dof_mask = np.zeros(self.nv, dtype=bool)
+        for dof_idx in getattr(self.robot, 'act_to_dof', []):
+            if dof_idx is not None and dof_idx >= 0:
+                self.actuated_dof_mask[dof_idx] = True
+        if not np.any(self.actuated_dof_mask):
+            self.actuated_dof_mask[:] = True
 
         # Flag: solver won't run until sync_from_sim is called
         self._ready = False
@@ -95,10 +103,11 @@ class WholeBodyIK:
         lf_id = self.robot.left_foot_id
         rf_id = self.robot.right_foot_id
 
-        # Store current foot positions as targets
-        # xpos[body_id]: body origin position in world frame [3]
-        self.lf_pos_target = self.ik_data.xpos[lf_id].copy()
-        self.rf_pos_target = self.ik_data.xpos[rf_id].copy()
+        # Store current foot body-CoM positions as targets.
+        # `mj_jacBody` returns the linear Jacobian at body CoM, so the
+        # position error must use `xipos` (body CoM position), not `xpos`.
+        self.lf_pos_target = self.ik_data.xipos[lf_id].copy()
+        self.rf_pos_target = self.ik_data.xipos[rf_id].copy()
 
         # Store current foot orientations as targets
         # xmat[body_id]: body rotation matrix (flattened 9 values → reshape to 3x3)
@@ -191,11 +200,11 @@ class WholeBodyIK:
             # err_com [3]: how far CoM is from target (in meters)
             err_com = com_target - self.ik_data.subtree_com[0]
 
-            # err_lf_p [3]: left foot position error [meters]
-            err_lf_p = self.lf_pos_target - self.ik_data.xpos[lf_id]
+            # err_lf_p [3]: left foot body-CoM position error [meters]
+            err_lf_p = self.lf_pos_target - self.ik_data.xipos[lf_id]
 
-            # err_rf_p [3]: right foot position error [meters]
-            err_rf_p = self.rf_pos_target - self.ik_data.xpos[rf_id]
+            # err_rf_p [3]: right foot body-CoM position error [meters]
+            err_rf_p = self.rf_pos_target - self.ik_data.xipos[rf_id]
 
             # err_lf_r [3]: left foot orientation error [radians, as axis-angle]
             err_lf_r = self._rot_error(
@@ -289,6 +298,10 @@ class WholeBodyIK:
             # Solve linear system: dq = H^(-1) * g
             # dq [nv]: optimal joint velocity vector [rad/s]
             dq = np.linalg.solve(H, g)
+
+            # Zero unactuated DOFs (notably floating base) so IK produces
+            # targets that the actuator layer can actually track.
+            dq[~self.actuated_dof_mask] = 0.0
 
             # --- Velocity clamp ---
             # max_vel: Maximum allowed joint velocity

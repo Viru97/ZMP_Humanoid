@@ -366,6 +366,7 @@ class VisualizedPhaseManager:
 
         # Get IK iteration count for tracking mode
         ik_tracking_iter = cfg.IK.TRACKING_ITERATIONS
+        sync_each_tick = not self.robot.is_position_controlled
 
         for tick in range(n_ticks):
             # --- Compute smooth interpolation factor ---
@@ -382,26 +383,25 @@ class VisualizedPhaseManager:
             fc = self.robot.get_foot_center(self.data)
             com = self.robot.get_com(self.data)
 
-            # --- CoM target: blend from current toward foot center ---
-            # XY: interpolate toward being directly above feet
+            # --- CoM target: blend from initial toward foot center ---
+            # XY: interpolate from the phase-start CoM to foot center.
+            # Using the current CoM here causes the target to chase drift.
             # Z: DON'T control — let physics determine height naturally.
             #    Trying to force a specific height fights gravity and
             #    can cause instability (this was a key bug in original code).
             com_target = np.array([
-                (1.0 - alpha) * com[0] + alpha * fc[0],
-                (1.0 - alpha) * com[1] + alpha * fc[1],
+                (1.0 - alpha) * initial_com[0] + alpha * foot_center[0],
+                (1.0 - alpha) * initial_com[1] + alpha * foot_center[1],
                 com[2]  # Keep current height (let physics decide)
             ])
 
-            # CRITICAL: Sync IK with sim every tick
-            # "Tracking mode" — planner stays close to actual state.
-            # Without this, small errors accumulate and the IK plans
-            # configurations the robot can never achieve.
-            self.ik.sync_from_sim(self.data.qpos)
+            # For torque control we can safely re-sync every tick.
+            # For position servos, per-tick sync collapses command error
+            # (q_target ~= q_current), which removes support torque.
+            if sync_each_tick:
+                self.ik.sync_from_sim(self.data.qpos)
 
-            # Solve IK with tracking iterations (fast, for real-time tracking)
-            # Fewer iterations because we sync every tick anyway.
-            # The small residual error is corrected next tick.
+            # Solve IK in planner space and command the resulting joint target.
             q_target = self.ik.solve(com_target, dt=self.ctrl_dt, n_iter=ik_tracking_iter)
             self.step_sim(q_target, com_target=com_target)
 
@@ -468,10 +468,12 @@ class VisualizedPhaseManager:
 
         # Get IK iteration count for tracking mode
         ik_tracking_iter = cfg.IK.TRACKING_ITERATIONS
+        sync_each_tick = not self.robot.is_position_controlled
 
         for tick in range(n_ticks):
-            # Track mode: sync every tick, solve, apply
-            self.ik.sync_from_sim(self.data.qpos)
+            # Keep periodic re-sync only in torque mode.
+            if sync_each_tick:
+                self.ik.sync_from_sim(self.data.qpos)
             q_target = self.ik.solve(hold_target, dt=self.ctrl_dt, n_iter=ik_tracking_iter)
             self.step_sim(q_target, com_target=hold_target)
 
@@ -544,31 +546,90 @@ class VisualizedPhaseManager:
         self.ik.sync_from_sim(self.data.qpos)
         self.ik.capture_foot_targets()
 
+        # Position-servo fallback: long-horizon IK in this phase is prone to
+        # drift/runaway on this G1 setup. Use a conservative joint-space sway.
+        if self.robot.is_position_controlled:
+            print("  [ZMP] Using position-servo fallback (waist-roll sway).")
+
+            def _find_joint_qpos_idx(name_tokens):
+                for j in range(self.model.njnt):
+                    jname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+                    jname_l = jname.lower()
+                    if any(tok in jname_l for tok in name_tokens):
+                        return self.model.jnt_qposadr[j]
+                return None
+
+            waist_roll_idx = _find_joint_qpos_idx(["waist_roll_joint", "waist_roll"])
+            if waist_roll_idx is None:
+                print("  [ZMP] waist_roll joint not found, skipping sway to stay safe.")
+                return True
+
+            n_ticks = int(duration / self.ctrl_dt)
+            status_interval = max(1, int(self.phase_cfg.STATUS_INTERVAL / self.ctrl_dt))
+            # Use model default standing pose as the base posture for sway.
+            # Using the current drifted pose can compound instability over time.
+            base_q = self.model.qpos0.copy()
+
+            # Convert requested lateral sway (meters) to a small waist-roll angle.
+            # 4 rad/m maps 2cm -> 0.08rad (~4.6 deg), conservative for stability.
+            roll_gain = 4.0
+            max_roll = 0.10  # rad
+
+            for tick in range(n_ticks):
+                t = tick * self.ctrl_dt
+
+                ramp = 0.0
+                if t > zmp_cfg.SWAY_RAMP_START:
+                    ramp = min(1.0, (t - zmp_cfg.SWAY_RAMP_START) / max(zmp_cfg.SWAY_RAMP_DURATION, 1e-6))
+                    ramp = ramp * ramp * (3.0 - 2.0 * ramp)
+
+                sway_y = amplitude * ramp * np.sin(2.0 * np.pi * frequency * max(0.0, t - zmp_cfg.SWAY_RAMP_START))
+                roll_cmd = np.clip(roll_gain * sway_y, -max_roll, max_roll)
+
+                q_target = base_q.copy()
+                q_target[waist_roll_idx] = base_q[waist_roll_idx] + roll_cmd
+
+                com_now = self.robot.get_com(self.data)
+                com_target = np.array([com_now[0], com_now[1] + sway_y, com_now[2]])
+                self.step_sim(q_target, com_target=com_target,
+                              ref_zmp_xy=np.array([com_now[0], com_now[1] + sway_y]))
+
+                if tick % status_interval == 0:
+                    status = self.monitor.snapshot(self.data, "ZMP", tick, com_target)
+                    self.monitor.print_status(status)
+                    if self.monitor.is_fallen(self.data):
+                        print("  *** FALLEN during ZMP control! ***")
+                        return False
+
+                if not self.viewer.is_running():
+                    print("  Viewer closed by user.")
+                    return True
+
+                time.sleep(self.ctrl_dt)
+
+            print("  ZMP SWAY COMPLETE.")
+            return True
+
         # Get starting CoM position and height
         com = self.robot.get_com(self.data)
+        foot_center = self.robot.get_foot_center(self.data)
         # z_c: LIPM pendulum height — critical parameter for ZMP controller
         # Must match actual CoM height for the LIPM model to be accurate.
         z_c = com[2]
 
-        # Create separate ZMP controllers for X and Y axes
-        # X: sagittal (forward/backward) — held constant (no walking yet)
-        # Y: lateral (side-to-side) — sway oscillation
-        zmp_x = ZMPPreviewController(z_c=z_c, dt=self.ctrl_dt,
-                                      preview_time=zmp_cfg.PREVIEW_TIME)
+        # Create ZMP controller for Y axis only.
+        # For sway-only balance, sagittal (X) preview actuation is disabled to
+        # avoid exciting forward-fall modes in position-servo tracking.
         zmp_y = ZMPPreviewController(z_c=z_c, dt=self.ctrl_dt,
                                       preview_time=zmp_cfg.PREVIEW_TIME)
-        # Initialize both controllers at current CoM position
-        zmp_x.reset(com[0])
+        # Initialize controller at current lateral CoM position
         zmp_y.reset(com[1])
 
         # --- Generate ZMP reference trajectory ---
         n_ticks = int(duration / self.ctrl_dt)
-        N_prev = zmp_x.N  # Preview horizon length
+        N_prev = zmp_y.N  # Preview horizon length
         # Total samples needed: simulation ticks + preview buffer
         total = n_ticks + N_prev
-
-        # X reference: constant (stand still in sagittal plane)
-        ref_x = np.full(total, com[0])
 
         # Y reference: sinusoidal sway with ramp-up
         ref_y = np.full(total, com[1])
@@ -596,8 +657,12 @@ class VisualizedPhaseManager:
 
         print(f"  Starting ZMP control loop ({n_ticks} ticks, {duration:.0f}s)...")
 
-        # Get IK sync interval from config
+        # Get IK sync interval from config.
+        # For position servos, use moderate periodic sync to limit planner drift
+        # while preserving enough command error for servo torque generation.
         ik_sync_interval = self.ctrl_cfg.IK_SYNC_INTERVAL
+        if self.robot.is_position_controlled:
+            ik_sync_interval = max(ik_sync_interval, 10)
         # Get IK iteration count for dynamic tracking
         ik_default_iter = cfg.IK.DEFAULT_ITERATIONS
 
@@ -608,10 +673,11 @@ class VisualizedPhaseManager:
             # Feed the reference trajectory from current tick onward.
             # The controller looks N_prev steps into the future.
             # Returns: desired CoM position that will produce the desired ZMP.
-            com_x, _ = zmp_x.step(ref_x[tick:tick + N_prev])
             com_y, _ = zmp_y.step(ref_y[tick:tick + N_prev])
-            # Full 3D CoM target: X and Y from ZMP controller, Z held at LIPM height
-            com_target = np.array([com_x, com_y, z_c])
+            # X and Z from current robot state, Y from preview controller.
+            # Holding Z fixed over-constrains IK with fixed feet and can induce falls.
+            com_now = self.robot.get_com(self.data)
+            com_target = np.array([com_now[0], com_y, com_now[2]])
 
             # --- IK solve ---
             # Sync with simulation at configured interval
@@ -629,7 +695,7 @@ class VisualizedPhaseManager:
             # Step simulation with the IK-solved target
             self.step_sim(q_target, sync_viewer=True, realtime=False,
                           com_target=com_target,
-                          ref_zmp_xy=np.array([ref_x[tick], ref_y[tick]]))
+                          ref_zmp_xy=np.array([com_now[0], ref_y[tick]]))
 
             # --- Monitoring ---
             # Every 200 ticks (2.0s): detailed status print

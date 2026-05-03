@@ -21,7 +21,7 @@ class JointController:
         We compute the full PD + feedforward ourselves.
     """
 
-    def __init__(self, robot: G1Model):
+    def __init__(self, robot: G1RobotModel):
         self.robot = robot
         self.model = robot.model
         # Get default torque limit from config
