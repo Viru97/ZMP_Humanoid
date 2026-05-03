@@ -1,7 +1,8 @@
 import mujoco
 import numpy as np
 from typing import Optional
-from robot_model import G1RobotModel
+# from robot_model import G1RobotModel
+from robot_model import G1Model
 from config import cfg
 
 
@@ -25,12 +26,12 @@ class WholeBodyIK:
     - Iterative solver: multiple Gauss-Newton steps per call
     """
 
-    def __init__(self, robot: G1RobotModel):
+    def __init__(self, robot: G1Model):
         self.robot = robot
         self.model = robot.model
         # nv: Degrees of freedom (velocity-space dimension)
         # This is the dimension of joint velocity vector / Jacobian columns
-        self.nv = robot.nv
+        self.nv = self.model.nv
 
         # Internal planning data — SEPARATE from simulation
         # This prevents IK from being corrupted if the real robot falls.

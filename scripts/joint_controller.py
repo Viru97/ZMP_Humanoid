@@ -1,6 +1,6 @@
 import mujoco
 import numpy as np
-from robot_model import G1RobotModel
+from g1_robot_model import G1RobotModel
 from config import cfg
 
 
@@ -21,7 +21,7 @@ class JointController:
         We compute the full PD + feedforward ourselves.
     """
 
-    def __init__(self, robot: G1RobotModel):
+    def __init__(self, robot: G1Model):
         self.robot = robot
         self.model = robot.model
         # Get default torque limit from config

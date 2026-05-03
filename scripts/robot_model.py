@@ -1,216 +1,444 @@
+"""
+Unitree G1 Robot Model Wrapper for MuJoCo
+
+Provides:
+- Forward/Inverse Kinematics
+- Jacobian computation
+- Center of Mass calculation
+- Support polygon computation
+"""
+
 import mujoco
-from dataclasses import dataclass
-from typing import List, Optional
 import numpy as np
-from config import cfg
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict, List
+from pathlib import Path
 
 
 @dataclass
-class g1BodyIDs:
-    """Struct to hold important MuJoCo body IDs for quick access."""
-    pelvis: int
-    left_foot: int
-    right_foot: int
+class JointGroup:
+    """Defines a group of joints (e.g., left arm, right leg)"""
+    name: str
+    joint_names: List[str]
+    joint_ids: List[int] = None
+    actuator_ids: List[int] = None
 
 
-# ================================================================
-# MODULE 2: Robot Model Interface
-# ================================================================
-class G1RobotModel:
+@dataclass
+class RobotState:
+    """Complete robot state"""
+    qpos: np.ndarray  # Joint positions (including floating base)
+    qvel: np.ndarray  # Joint velocities
+    com: np.ndarray  # Center of mass position [x, y, z]
+    com_vel: np.ndarray  # Center of mass velocity
+    left_foot_pos: np.ndarray
+    right_foot_pos: np.ndarray
+    left_hand_pos: np.ndarray
+    right_hand_pos: np.ndarray
+
+
+class G1Model:
     """
-    Identifies and stores G1 robot structure.
+    Unitree G1 Robot Model
 
-    Automatically detects:
-    - Foot body IDs (for ground contact / IK constraints)
-    - Actuator type (position servo vs torque)
-    - Joint-to-actuator mappings
-    - Appropriate PD gains per joint group
+    Handles all kinematics and dynamics computations using MuJoCo.
     """
 
-    def __init__(self, model: mujoco.MjModel):
-        self.model = model
-        # nq: Number of generalized coordinates (joint positions)
-        #     For G1: 7 (floating base: xyz + quaternion) + N_joints
-        self.nq = model.nq
-        # nv: Number of degrees of freedom (joint velocities)
-        #     For G1: 6 (floating base: linear + angular vel) + N_joints
-        #     Note: nv < nq because quaternion (4 values) → angular vel (3 values)
-        self.nv = model.nv
-        # nu: Number of actuators (motors)
-        self.nu = model.nu
+    # Joint group definitions based on actual G1 structure
+    JOINT_GROUPS = {
+        'left_arm': [
+            'left_shoulder_pitch_joint',
+            'left_shoulder_roll_joint',
+            'left_shoulder_yaw_joint',
+            'left_elbow_joint',
+            'left_wrist_roll_joint',
+            'left_wrist_pitch_joint',
+            'left_wrist_yaw_joint'
+        ],
+        'right_arm': [
+            'right_shoulder_pitch_joint',
+            'right_shoulder_roll_joint',
+            'right_shoulder_yaw_joint',
+            'right_elbow_joint',
+            'right_wrist_roll_joint',
+            'right_wrist_pitch_joint',
+            'right_wrist_yaw_joint'
+        ],
+        'left_leg': [
+            'left_hip_pitch_joint',
+            'left_hip_roll_joint',
+            'left_hip_yaw_joint',
+            'left_knee_joint',
+            'left_ankle_pitch_joint',
+            'left_ankle_roll_joint'
+        ],
+        'right_leg': [
+            'right_hip_pitch_joint',
+            'right_hip_roll_joint',
+            'right_hip_yaw_joint',
+            'right_knee_joint',
+            'right_ankle_pitch_joint',
+            'right_ankle_roll_joint'
+        ],
+        'waist': [
+            'waist_yaw_joint',
+            'waist_roll_joint',
+            'waist_pitch_joint'
+        ]
+    }
 
-        # Get robot configuration from config
-        robot_cfg = cfg.ROBOT
+    # End-effector body names
+    END_EFFECTORS = {
+        'left_hand': 'left_wrist_yaw_link',
+        'right_hand': 'right_wrist_yaw_link',
+        'left_foot': 'left_ankle_roll_link',
+        'right_foot': 'right_ankle_roll_link'
+    }
 
-        # --- Find foot bodies ---
-        # These are the bodies whose poses we constrain in IK to keep feet planted.
-        # We search by name patterns common in humanoid models.
-        # The ankle_roll_link is typically the lowest link before the foot sole.
-        self.left_foot_id = self._find_body(list(robot_cfg.LEFT_FOOT_CANDIDATES))
-        self.right_foot_id = self._find_body(list(robot_cfg.RIGHT_FOOT_CANDIDATES))
+    # Foot dimensions (approximate, for support polygon)
+    FOOT_LENGTH = 0.10  # m, front to back
+    FOOT_WIDTH = 0.05  # m, side to side
 
-        if self.left_foot_id < 0 or self.right_foot_id < 0:
-            print("  WARNING: Foot bodies not found! Listing all bodies:")
-            self._list_bodies()
-
-        # --- Detect actuator type ---
-        # MuJoCo supports multiple actuator types:
-        # - Position servo: ctrl = desired position, internal PD computes torque
-        # - Torque/force: ctrl = raw torque applied to joint
-        # G1 model uses position servos (gainprm/biasprm define internal PD).
-        self.is_position_controlled = self._detect_position_actuators()
-
-        # --- Build actuator-to-joint mappings ---
-        # Each actuator drives one joint. We need the mapping to:
-        # - Read current joint angle (qpos[act_to_qpos[i]])
-        # - Read current joint velocity (qvel[act_to_dof[i]])
-        # - Apply control to correct actuator
-        self.act_to_qpos = []  # actuator index → qpos index
-        self.act_to_dof = []   # actuator index → dof/qvel index
-        self.act_to_jnt = []   # actuator index → joint id
-        for i in range(model.nu):
-            # Check that actuator transmits to a joint (not tendon/site/etc)
-            if model.actuator_trntype[i] == mujoco.mjtTrn.mjTRN_JOINT:
-                jnt_id = model.actuator_trnid[i, 0]
-                self.act_to_qpos.append(model.jnt_qposadr[jnt_id])
-                self.act_to_dof.append(model.jnt_dofadr[jnt_id])
-                self.act_to_jnt.append(jnt_id)
-            else:
-                self.act_to_qpos.append(-1)
-                self.act_to_dof.append(-1)
-                self.act_to_jnt.append(-1)
-
-        # --- PD gains for torque control mode ---
-        # kp: Proportional gain [Nm/rad]. Higher → stiffer tracking.
-        # kd: Derivative gain [Nm*s/rad]. Higher → more damping (less oscillation).
-        # Only used if actuators are torque-type. Position servos have built-in PD.
-        self.kp = np.full(model.nu, robot_cfg.KP_JOINT_DEFAULT)  # Default: moderate stiffness
-        self.kd = np.full(model.nu, robot_cfg.KD_JOINT_DEFAULT)  # Default: moderate damping
-        if not self.is_position_controlled:
-            self._set_joint_gains()
-
-        self._print_info()
-
-    def _find_body(self, candidates: List[str]) -> int:
+    def __init__(self, model_path: str = None):
         """
-        Search for a body by name from a list of candidates.
-        Case-insensitive partial matching.
+        Initialize G1 model.
 
-        Parameters:
-            candidates: List of name substrings to search for,
-                       ordered by priority (first match wins).
+        Args:
+            model_path: Path to scene.xml. If None, uses default location.
         """
-        for i in range(self.model.nbody):
-            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, i)
-            if not name:
-                continue
-            for c in candidates:
-                if c.lower() in name.lower():
-                    return i
-        return -1
+        if model_path is None:
+            # Default path relative to project root
+            model_path = Path(__file__).parent.parent / 'assets' /'robot_descriptions'/'mujoco_menagerie' / 'unitree_g1' / 'scene.xml'
 
-    def _detect_position_actuators(self) -> bool:
-        """
-        Detect if actuators are position-controlled PD servos.
+        self.model_path = Path(model_path)
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model not found at {self.model_path}")
 
-        MuJoCo position servos are defined with:
-        - biastype = mjBIAS_AFFINE (bias is affine function of state)
-        - gainprm[0] = kp > 0 (position gain)
-        - biasprm = [0, -kp, -kd] where:
-            biasprm[0] = 0 (no constant bias)
-            biasprm[1] = -kp (spring toward ctrl target)
-            biasprm[2] = -kd (velocity damping)
+        # Load MuJoCo model
+        self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
+        self.data = mujoco.MjData(self.model)
 
-        The generated force is: f = gainprm[0]*ctrl + biasprm[0] + biasprm[1]*q + biasprm[2]*v
-                                  = kp*(ctrl - q) - kd*v  (PD servo!)
+        # Cache joint and body IDs for fast lookup
+        self._build_id_cache()
 
-        Returns:
-            True if first actuator is a position servo, False otherwise.
-        """
-        if self.model.nu == 0:
-            return False
-        biastype = self.model.actuator_biastype[0]
-        if biastype == mujoco.mjtBias.mjBIAS_AFFINE:
-            gainprm = self.model.actuator_gainprm[0]
-            biasprm = self.model.actuator_biasprm[0]
-            if gainprm[0] > 0 and biasprm[1] < 0:
-                return True
-        return False
+        # Total robot mass
+        self.total_mass = sum(self.model.body_mass)
 
-    def _set_joint_gains(self):
-        """
-        Set per-joint PD gains for torque control mode.
+        # Initialize to standing pose
+        self.reset()
 
-        Different joint groups need different gains:
-        - Hip/Knee: High gains — large masses, need stiffness for balance
-        - Ankle: Medium-high — critical for balance but lower inertia
-        - Waist/Torso: Medium — upper body stability
-        - Arms/Hands: Low — low inertia, don't need to be stiff
+    def _build_id_cache(self):
+        """Build caches for joint, actuator, and body IDs"""
 
-        The ratio kd/kp ≈ 0.1 gives critical damping for typical joint inertias.
-        Underdamped (kd too low) → oscillations.
-        Overdamped (kd too high) → sluggish response.
-        """
-        # Get gains from config
-        robot_cfg = cfg.ROBOT
+        # Joint name to ID mapping
+        self.joint_ids = {}
+        for i in range(self.model.njnt):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, i)
+            if name:
+                self.joint_ids[name] = i
 
+        # Actuator name to ID mapping
+        self.actuator_ids = {}
         for i in range(self.model.nu):
-            jnt_id = self.act_to_jnt[i]
-            if jnt_id < 0:
-                continue
-            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id) or ""
-            nl = name.lower()
-            if 'hip' in nl:
-                self.kp[i], self.kd[i] = robot_cfg.KP_HIP, robot_cfg.KD_HIP
-            elif 'knee' in nl:
-                self.kp[i], self.kd[i] = robot_cfg.KP_KNEE, robot_cfg.KD_KNEE
-            elif 'ankle' in nl:
-                self.kp[i], self.kd[i] = robot_cfg.KP_ANKLE, robot_cfg.KD_ANKLE
-            elif 'waist' in nl or 'torso' in nl:
-                self.kp[i], self.kd[i] = robot_cfg.KP_WAIST, robot_cfg.KD_WAIST
-            else:
-                self.kp[i], self.kd[i] = robot_cfg.KP_ARM, robot_cfg.KD_ARM
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+            if name:
+                self.actuator_ids[name] = i
 
-    def _list_bodies(self):
-        """Print all body names for debugging model structure."""
+        # Body name to ID mapping
+        self.body_ids = {}
         for i in range(self.model.nbody):
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, i)
-            print(f"    body[{i}]: {name}")
+            if name:
+                self.body_ids[name] = i
 
-    def _print_info(self):
-        """Print identified robot structure."""
-        lf_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, self.left_foot_id)
-        rf_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, self.right_foot_id)
-        print(f"  [Robot] nq={self.nq}, nv={self.nv}, nu={self.nu}")
-        print(f"  [Robot] Left foot:  id={self.left_foot_id} '{lf_name}'")
-        print(f"  [Robot] Right foot: id={self.right_foot_id} '{rf_name}'")
-        print(f"  [Robot] Position-controlled actuators: {self.is_position_controlled}")
-        if self.is_position_controlled:
-            # Read the built-in servo gains from model definition
-            kp = self.model.actuator_gainprm[0, 0]
-            kd = -self.model.actuator_biasprm[0, 2]
-            print(f"  [Robot] Built-in servo PD: kp={kp:.1f}, kd={kd:.1f}")
+        # Site name to ID mapping
+        self.site_ids = {}
+        for i in range(self.model.nsite):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_SITE, i)
+            if name:
+                self.site_ids[name] = i
 
-    def get_foot_center(self, data: mujoco.MjData) -> np.ndarray:
+        # Build joint group ID lists
+        self.joint_groups = {}
+        for group_name, joint_names in self.JOINT_GROUPS.items():
+            joint_ids = [self.joint_ids[jn] for jn in joint_names]
+            # Get qpos indices (accounting for floating base which uses 7 qpos values)
+            qpos_indices = []
+            for jid in joint_ids:
+                qpos_idx = self.model.jnt_qposadr[jid]
+                qpos_indices.append(qpos_idx)
+
+            actuator_ids = [self.actuator_ids.get(jn) for jn in joint_names]
+
+            self.joint_groups[group_name] = {
+                'joint_names': joint_names,
+                'joint_ids': joint_ids,
+                'qpos_indices': qpos_indices,
+                'actuator_ids': [a for a in actuator_ids if a is not None]
+            }
+
+    def reset(self):
+        """Reset robot to default standing pose"""
+        mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
+
+    def set_qpos(self, qpos: np.ndarray):
+        """Set joint positions and update kinematics"""
+        self.data.qpos[:] = qpos
+        mujoco.mj_forward(self.model, self.data)
+
+    def get_qpos(self) -> np.ndarray:
+        """Get current joint positions"""
+        return self.data.qpos.copy()
+
+    def get_joint_positions(self, group: str) -> np.ndarray:
+        """Get joint positions for a specific group (e.g., 'left_arm')"""
+        indices = self.joint_groups[group]['qpos_indices']
+        return self.data.qpos[indices].copy()
+
+    def set_joint_positions(self, group: str, positions: np.ndarray):
+        """Set joint positions for a specific group"""
+        indices = self.joint_groups[group]['qpos_indices']
+        self.data.qpos[indices] = positions
+        mujoco.mj_forward(self.model, self.data)
+
+    def get_joint_limits(self, group: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Get joint limits (lower, upper) for a group"""
+        joint_ids = self.joint_groups[group]['joint_ids']
+        lower = np.array([self.model.jnt_range[jid, 0] for jid in joint_ids])
+        upper = np.array([self.model.jnt_range[jid, 1] for jid in joint_ids])
+        return lower, upper
+
+    # ==================== FORWARD KINEMATICS ====================
+
+    def get_body_position(self, body_name: str) -> np.ndarray:
+        """Get world position of a body"""
+        body_id = self.body_ids[body_name]
+        return self.data.xpos[body_id].copy()
+
+    def get_body_rotation(self, body_name: str) -> np.ndarray:
+        """Get rotation matrix (3x3) of a body in world frame"""
+        body_id = self.body_ids[body_name]
+        return self.data.xmat[body_id].reshape(3, 3).copy()
+
+    def get_body_pose(self, body_name: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Get position and rotation of a body"""
+        return self.get_body_position(body_name), self.get_body_rotation(body_name)
+
+    def get_end_effector_position(self, effector: str) -> np.ndarray:
         """
-        Midpoint between left and right foot positions.
-        This approximates the center of the support polygon.
-        For static balance, CoM should project onto this point.
+        Get end-effector position.
+
+        Args:
+            effector: One of 'left_hand', 'right_hand', 'left_foot', 'right_foot'
+        """
+        body_name = self.END_EFFECTORS[effector]
+        return self.get_body_position(body_name)
+
+    def get_end_effector_pose(self, effector: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Get end-effector position and rotation"""
+        body_name = self.END_EFFECTORS[effector]
+        return self.get_body_pose(body_name)
+
+    # ==================== JACOBIANS ====================
+
+    def get_jacobian(self, body_name: str) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute Jacobian for a body.
 
         Returns:
-            np.ndarray, shape (3,): [x, y, z] midpoint in world frame.
+            jacp: Position Jacobian (3 x nv)
+            jacr: Rotation Jacobian (3 x nv)
         """
-        lf = data.xpos[self.left_foot_id]
-        rf = data.xpos[self.right_foot_id]
-        return (lf + rf) / 2.0
+        body_id = self.body_ids[body_name]
 
-    def get_com(self, data: mujoco.MjData) -> np.ndarray:
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+
+        mujoco.mj_jacBody(self.model, self.data, jacp, jacr, body_id)
+
+        return jacp, jacr
+
+    def get_end_effector_jacobian(self, effector: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Get Jacobian for an end-effector"""
+        body_name = self.END_EFFECTORS[effector]
+        return self.get_jacobian(body_name)
+
+    def get_arm_jacobian(self, arm: str) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Whole-body center of mass position.
-        Calls mj_comPos to update subtree_com before reading.
+        Get Jacobian columns corresponding to arm joints only.
+
+        Args:
+            arm: 'left' or 'right'
 
         Returns:
-            np.ndarray, shape (3,): [x, y, z] CoM in world frame.
+            jacp: Position Jacobian for arm joints (3 x 7)
+            jacr: Rotation Jacobian for arm joints (3 x 7)
         """
-        mujoco.mj_comPos(self.model, data)
-        return data.subtree_com[0].copy()
+        effector = f'{arm}_hand'
+        full_jacp, full_jacr = self.get_end_effector_jacobian(effector)
+
+        # Get velocity indices for arm joints
+        group = f'{arm}_arm'
+        joint_ids = self.joint_groups[group]['joint_ids']
+
+        # MuJoCo velocity indices
+        dof_indices = []
+        for jid in joint_ids:
+            dof_idx = self.model.jnt_dofadr[jid]
+            dof_indices.append(dof_idx)
+
+        jacp = full_jacp[:, dof_indices]
+        jacr = full_jacr[:, dof_indices]
+
+        return jacp, jacr
+
+    # ==================== CENTER OF MASS ====================
+
+    def get_com(self) -> np.ndarray:
+        """Get center of mass position in world frame"""
+        # subtree_com[0] is world, [1] is typically the robot base
+        # We compute it manually for accuracy
+        com = np.zeros(3)
+        total_mass = 0.0
+
+        for i in range(1, self.model.nbody):  # Skip world body
+            mass = self.model.body_mass[i]
+            pos = self.data.xipos[i]  # Body CoM in world frame
+            com += mass * pos
+            total_mass += mass
+
+        return com / total_mass
+
+    def get_com_jacobian(self) -> np.ndarray:
+        """
+        Compute Jacobian of center of mass.
+
+        Returns:
+            jac_com: (3 x nv) Jacobian mapping joint velocities to CoM velocity
+        """
+        jac_com = np.zeros((3, self.model.nv))
+
+        for i in range(1, self.model.nbody):
+            mass = self.model.body_mass[i]
+            jacp = np.zeros((3, self.model.nv))
+            jacr = np.zeros((3, self.model.nv))
+            mujoco.mj_jacBodyCom(self.model, self.data, jacp, jacr, i)
+            jac_com += mass * jacp
+
+        jac_com /= self.total_mass
+        return jac_com
+
+    # ==================== SUPPORT POLYGON ====================
+
+    def get_foot_positions(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get left and right foot positions"""
+        left_id = self.site_ids['left_foot']
+        right_id = self.site_ids['right_foot']
+        return self.data.site_xpos[left_id].copy(), self.data.site_xpos[right_id].copy()
+
+    def get_support_polygon(self, mode: str = 'double') -> np.ndarray:
+        """
+        Get support polygon vertices.
+
+        Args:
+            mode: 'double' (both feet), 'left' (left foot only), 'right' (right foot only)
+
+        Returns:
+            vertices: (N x 2) array of polygon vertices in world XY plane
+        """
+        left_pos, right_pos = self.get_foot_positions()
+
+        # Foot rectangle corners (in foot frame, then transformed)
+        half_l = self.FOOT_LENGTH / 2
+        half_w = self.FOOT_WIDTH / 2
+
+        if mode == 'double':
+            # Combine both feet into one polygon
+            vertices = np.array([
+                [left_pos[0] + half_l, left_pos[1] + half_w],  # Left foot front-left
+                [left_pos[0] + half_l, left_pos[1] - half_w],  # Left foot front-right
+                [left_pos[0] - half_l, left_pos[1] - half_w],  # Left foot back-right
+                [left_pos[0] - half_l, left_pos[1] + half_w],  # Left foot back-left
+                [right_pos[0] + half_l, right_pos[1] + half_w],  # Right foot front-left
+                [right_pos[0] + half_l, right_pos[1] - half_w],  # Right foot front-right
+                [right_pos[0] - half_l, right_pos[1] - half_w],  # Right foot back-right
+                [right_pos[0] - half_l, right_pos[1] + half_w],  # Right foot back-left
+            ])
+            # Compute convex hull
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(vertices)
+            return vertices[hull.vertices]
+
+        elif mode == 'left':
+            return np.array([
+                [left_pos[0] + half_l, left_pos[1] + half_w],
+                [left_pos[0] + half_l, left_pos[1] - half_w],
+                [left_pos[0] - half_l, left_pos[1] - half_w],
+                [left_pos[0] - half_l, left_pos[1] + half_w],
+            ])
+
+        elif mode == 'right':
+            return np.array([
+                [right_pos[0] + half_l, right_pos[1] + half_w],
+                [right_pos[0] + half_l, right_pos[1] - half_w],
+                [right_pos[0] - half_l, right_pos[1] - half_w],
+                [right_pos[0] - half_l, right_pos[1] + half_w],
+            ])
+
+    # ==================== FULL STATE ====================
+
+    def get_state(self) -> RobotState:
+        """Get complete robot state"""
+        left_foot, right_foot = self.get_foot_positions()
+
+        return RobotState(
+            qpos=self.data.qpos.copy(),
+            qvel=self.data.qvel.copy(),
+            com=self.get_com(),
+            com_vel=self.data.subtree_linvel[1].copy(),  # Approximate
+            left_foot_pos=left_foot,
+            right_foot_pos=right_foot,
+            left_hand_pos=self.get_end_effector_position('left_hand'),
+            right_hand_pos=self.get_end_effector_position('right_hand')
+        )
+
+    def print_state_summary(self):
+        """Print a summary of current robot state"""
+        state = self.get_state()
+        print("=" * 50)
+        print("G1 Robot State Summary")
+        print("=" * 50)
+        print(f"CoM Position:    [{state.com[0]:.4f}, {state.com[1]:.4f}, {state.com[2]:.4f}] m")
+        print(
+            f"Left Hand:       [{state.left_hand_pos[0]:.4f}, {state.left_hand_pos[1]:.4f}, {state.left_hand_pos[2]:.4f}] m")
+        print(
+            f"Right Hand:      [{state.right_hand_pos[0]:.4f}, {state.right_hand_pos[1]:.4f}, {state.right_hand_pos[2]:.4f}] m")
+        print(
+            f"Left Foot:       [{state.left_foot_pos[0]:.4f}, {state.left_foot_pos[1]:.4f}, {state.left_foot_pos[2]:.4f}] m")
+        print(
+            f"Right Foot:      [{state.right_foot_pos[0]:.4f}, {state.right_foot_pos[1]:.4f}, {state.right_foot_pos[2]:.4f}] m")
+
+
+# Quick test
+if __name__ == '__main__':
+    print("Testing G1Model...")
+    model = G1Model()
+    model.print_state_summary()
+
+    print("\nJoint groups:")
+    for name, group in model.joint_groups.items():
+        print(f"  {name}: {len(group['joint_ids'])} joints")
+
+    print("\nTesting Jacobian computation...")
+    jacp, jacr = model.get_arm_jacobian('left')
+    print(f"  Left arm position Jacobian shape: {jacp.shape}")
+    print(f"  Left arm rotation Jacobian shape: {jacr.shape}")
+
+    print("\nSupport polygon (double support):")
+    poly = model.get_support_polygon('double')
+    print(f"  Vertices: {len(poly)}")
+    for i, v in enumerate(poly):
+        print(f"    [{i}]: ({v[0]:.4f}, {v[1]:.4f})")
+
+    print("\nTest complete!")

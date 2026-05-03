@@ -6,7 +6,7 @@ import sys
 from typing import Tuple
 
 # Import custom modules
-from robot_model import G1RobotModel
+#from robot_model import G1RobotModel
 from phase_manager import VisualizedPhaseManager
 from config import cfg
 

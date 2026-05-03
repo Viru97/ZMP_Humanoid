@@ -2,7 +2,8 @@ import mujoco
 import numpy as np
 import time
 from typing import Optional
-from robot_model import G1RobotModel
+# from robot_model import G1RobotModel
+from g1_robot_model import G1RobotModel
 from zmp_controller import ZMPPreviewController
 from whole_body_ik import WholeBodyIK
 from joint_controller import JointController
@@ -136,7 +137,9 @@ class VisualizedPhaseManager:
         self.viewer = viewer
 
         # Create sub-modules
+        # Instantiate the runtime robot model wrapper using the active MuJoCo model
         self.robot = G1RobotModel(model)
+        
         self.controller = JointController(self.robot)
         self.ik = WholeBodyIK(self.robot)
         self.monitor = StatusMonitor(self.robot)
