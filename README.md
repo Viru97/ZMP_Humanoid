@@ -3,9 +3,7 @@
 A whole-body control pipeline for the Unitree G1 humanoid robot using MuJoCo simulation.
 
 ### Demo: Balancing
-<video src="demos/Balancing.mp4" controls width="100%">
-  Your browser does not support the video tag.
-</video>
+![Balancing demo](demos/Balancing.gif)
 *Note: This demo shows the robot successfully balancing, not walking or taking a step.*
 
 ## Project Status
