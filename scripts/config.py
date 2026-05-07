@@ -213,13 +213,13 @@ class ZMPControllerConfig:
 class PhaseManagerConfig:
     """Walking phase manager parameters for G1 robot locomotion."""
     # Phase timing (seconds)
-    SETTLE_TIME: float = 2.0  # Time to settle robot on ground after initialization
-    BALANCE_TIME: float = 2.0  # Time to maintain static balance before starting walk
-    PREPARE_TIME: float = 0.3  # Time to prepare for next step (transition to single support)
+    SETTLE_TIME: float = 3.0  # Time to settle robot on ground after initialization
+    BALANCE_TIME: float = 3.0  # Time to maintain static balance before starting walk
+    PREPARE_TIME: float = 0.5  # Time to prepare for next step (transition to single support)
     STEP_TIME: float = 0.6  # Duration of single support phase (stepping)
     DOUBLE_SUPPORT_TIME: float = 0.2  # Time in double support phase (both feet on ground)
-    STABILITY_HOLD_TIME: float = 2.0  # Time to hold and verify stability
-    ZMP_SWAY_DURATION: float = 5.0  # Duration of ZMP sway phase
+    STABILITY_HOLD_TIME: float = 3.0  # Time to hold and verify stability
+    ZMP_SWAY_DURATION: float = 10.0  # Duration of ZMP sway phase
     # Phase 4 implementation mode:
     # - "safe_sway": conservative joint-space sway fallback (recommended for G1 position servos)
     # - "preview_ik": full preview + IK tracking path

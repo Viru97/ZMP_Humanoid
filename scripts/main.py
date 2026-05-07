@@ -293,7 +293,7 @@ def main():
 
         # Phase 5: Single step walking
         print("\n  ZMP sway complete. Attempting single-step walking...")
-        if manager.phase_single_step(step_forward=zmp_cfg.STEP_LENGTH, duration=1.5):
+        if manager.phase_single_step(step_forward=zmp_cfg.STEP_LENGTH, duration=2.5):
             print("\n*** SINGLE STEP SUCCESSFUL! ***")
         else:
             print("\n*** SINGLE STEP FAILED - robot could not complete step ***")
@@ -319,3 +319,4 @@ def _wait_for_viewer(viewer):
 # ================================================================
 if __name__ == "__main__":
     main()
+
