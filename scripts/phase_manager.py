@@ -754,8 +754,8 @@ class VisualizedPhaseManager:
         ik_sync_interval = 5  # Sync every 5 ticks to reduce planner drift during weight-shift
 
         # Phase durations (as fractions of total time)
-        t_weight_shift = 0.35  # 35% of time: shift weight to right foot faster
-        t_swing = 0.75  # 75% of time: swing left foot forward
+        t_weight_shift = 0.45  # 35% of time: shift weight to right foot faster
+        t_swing = 0.85  # 75% of time: swing left foot forward
         t_landing = 1.0  # 100% of time: complete landing and stabilize
 
         n_weight_shift = int(n_ticks * t_weight_shift)
@@ -778,7 +778,7 @@ class VisualizedPhaseManager:
         # stays on the safe side of the support polygon estimate.
         support_com_target = np.array([
             right_foot_pos[0] - 0.005,
-            right_foot_pos[1] - 0.04,
+            right_foot_pos[1] - 0.02,  # reduced: 20mm inside right foot (was 40mm, too aggressive)
             initial_com[2]
         ])
 
